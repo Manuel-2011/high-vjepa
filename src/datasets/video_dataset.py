@@ -319,6 +319,7 @@ class VideoDataset(torch.utils.data.Dataset):
                 fstp = video_fps // self.fps
 
         assert fstp is not None and fstp > 0
+        fstp = int(fstp)
         clip_len = int(fpc * fstp)
 
         if self.filter_short_videos and len(vr) < clip_len:

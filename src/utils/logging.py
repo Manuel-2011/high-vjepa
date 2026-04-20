@@ -35,8 +35,12 @@ LOG_FORMAT = "[%(levelname)-8s][%(asctime)s][%(name)-20s][%(funcName)-25s] %(mes
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def get_logger(name=None, force=False):
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT, force=force)
+def get_logger(name=None, force=False, **kwargs):
+    if 'filename' in kwargs:
+        filename = kwargs['filename']
+        logging.basicConfig(filename=filename, level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT, force=force)
+    else:
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT, force=force)
     return logging.getLogger(name=name)
 
 

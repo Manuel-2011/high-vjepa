@@ -41,7 +41,7 @@ def process_main(rank, fname, world_size, devices):
 
     from src.utils.logging import get_logger
 
-    logger = get_logger(force=True)
+    logger = get_logger()
     if rank == 0:
         logger.setLevel(logging.INFO)
     else:
@@ -64,8 +64,14 @@ def process_main(rank, fname, world_size, devices):
         folder.mkdir(parents=True, exist_ok=True)
         with open(params_path, "w") as f:
             yaml.dump(params, f)
+    
+    if params.get('folder', None):
+        log_file = os.path.join(params["folder"], f"log_r{rank}.log")
+        logger = get_logger(force=True, filename=log_file)
 
     # Init distributed (access to comm between GPUS on same machine)
+    folder = params["folder"]
+    os.environ['TORCHELASTIC_ERROR_FILE'] = os.path.join(folder, "error.json")
     world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
     logger.info(f"Running... (rank: {rank}/{world_size})")
 

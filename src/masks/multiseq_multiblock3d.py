@@ -12,6 +12,52 @@ import torch
 _GLOBAL_SEED = 0
 logger = getLogger()
 
+class SimpleCollator(object):
+
+    def __init__(
+        self,
+        dataset_fpcs,
+    ):
+        super(SimpleCollator, self).__init__()
+
+        self.fpcs = dataset_fpcs
+
+    def __call__(self, batch):
+
+        # Batch: [buffer, label, clip_indices] for video
+        # or [buffer, label] for images
+        filtered_batches = {fpc: [] for fpc in self.fpcs}
+        for sample in batch:
+            # Check if sample is from video dataset (has clip_indices) or image dataset
+            if len(sample) >= 3 and isinstance(sample[-1], (list, tuple)):
+                # Video sample: sample[-1] is clip_indices, sample[-1][-1] contains frame indices
+                try:
+                    fpc = len(sample[-1][-1])
+                except (TypeError, IndexError):
+                    # Fallback: assume single frame if structure is unexpected
+                    fpc = 1
+            else:
+                # Image sample: single frame
+                fpc = 1
+            if fpc in filtered_batches:
+                filtered_batches[fpc] += [sample]
+
+        fpc_collations = []
+        for fpc in filtered_batches:
+            fpc_batch = filtered_batches[fpc]
+            batch_size = len(fpc_batch)
+            if batch_size == 0:
+                continue
+            collated_batch = torch.utils.data.default_collate(fpc_batch)
+            collated_masks_pred, collated_masks_enc = [], []
+            fpc_collations += [
+                (collated_batch, collated_masks_enc, collated_masks_pred)
+            ]
+
+        return fpc_collations
+
+    def step(self):
+        pass
 
 class MaskCollator(object):
 

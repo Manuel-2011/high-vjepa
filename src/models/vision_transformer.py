@@ -45,6 +45,7 @@ class VisionTransformer(nn.Module):
         use_activation_checkpointing=False,
         use_rope=False,
         handle_nonsquare_inputs=True,
+        is_causal=False,
         **kwargs
     ):
         super().__init__()
@@ -102,6 +103,7 @@ class VisionTransformer(nn.Module):
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[i],
                     norm_layer=norm_layer,
+                    is_causal=is_causal
                 )
                 for i in range(depth)
             ]

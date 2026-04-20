@@ -34,9 +34,12 @@ class PredictorMultiSeqWrapper(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, x, masks_x, masks_y, has_cls=False):
+    def forward(self, x, masks_x=None, masks_y=None, has_cls=False, is_causal=False):
+        if is_causal:
+            return [self.backbone(xi, has_cls=has_cls) for xi in x]
+        
         n = 0
-        outs = [[] for _ in x]
+        outs = [[] for _ in x]        
         for i, (xi, mxi, myi) in enumerate(zip(x, masks_x, masks_y)):
             for xij, mxij, myij in zip(xi, mxi, myi):
                 outs[i] += [self.backbone(xij, mxij, myij, mask_index=i, has_cls=has_cls)]

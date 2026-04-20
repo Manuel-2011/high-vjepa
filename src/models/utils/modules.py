@@ -275,6 +275,7 @@ class RoPEAttention(nn.Module):
         use_sdpa=True,
         grid_size=14,
         is_causal=False,
+        grid_depth=None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -292,6 +293,12 @@ class RoPEAttention(nn.Module):
         self.w_dim = int(2 * ((head_dim // 3) // 2))
         self.grid_size = grid_size
         self.is_causal = is_causal
+
+        P = self.grid_size * self.grid_size
+        temporal_mask = torch.tril(torch.ones(grid_depth, grid_depth))
+        patch_mask = torch.ones(P, P)
+        temp_attn_mask = torch.kron(temporal_mask, patch_mask)
+        self.register_buffer('temp_attn_mask', temp_attn_mask)
 
     def _get_frame_pos(self, ids, H_patches=None, W_patches=None):
         if H_patches is None or W_patches is None:
@@ -369,10 +376,22 @@ class RoPEAttention(nn.Module):
             q = torch.cat([qd, qh, qw], dim=-1)
             k = torch.cat([kd, kh, kw], dim=-1)
 
-        if attn_mask is not None or self.use_sdpa:
+        if (attn_mask is not None or self.use_sdpa) and not self.is_causal:
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
+                )
+                attn = None
+        elif self.is_causal:
+            # attn_mask = torch.tril(torch.ones(T,T, device=q.device))
+            # attn_mask = attn_mask.unsqueeze(1).unsqueeze(-1).repeat(1, H_patches * W_patches, 1, H_patches * W_patches)
+            # attn_mask = attn_mask.reshape(T * H_patches * W_patches, T * H_patches * W_patches)
+
+            current_patches_num = grid_depth * self.grid_size * self.grid_size
+            attn_mask = self.temp_attn_mask[:current_patches_num,:current_patches_num]
+            with torch.backends.cuda.sdp_kernel():
+                x = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=self.proj_drop_prob, attn_mask=attn_mask
                 )
                 attn = None
         else:
@@ -520,6 +539,7 @@ class Block(nn.Module):
         is_causal=False,
         grid_size=16,
         use_rope=False,
+        grid_depth=None,
         **kwargs,
     ):
         super().__init__()
@@ -535,6 +555,7 @@ class Block(nn.Module):
                 is_causal=is_causal,
                 grid_size=grid_size,
                 proj_drop=drop,
+                grid_depth=grid_depth
             )
         else:
             self.attn = Attention(

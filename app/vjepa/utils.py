@@ -158,6 +158,7 @@ def init_video_model(
     use_pred_silu=False,
     wide_silu=False,
     use_activation_checkpointing=False,
+    is_causal=False
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -170,6 +171,7 @@ def init_video_model(
         wide_silu=wide_silu,
         use_activation_checkpointing=use_activation_checkpointing,
         use_rope=use_rope,
+        is_causal=is_causal
     )
     encoder = MultiSeqWrapper(encoder)
     predictor = vit_pred.__dict__["vit_predictor"](
@@ -190,6 +192,7 @@ def init_video_model(
         use_silu=use_pred_silu,
         wide_silu=wide_silu,
         use_activation_checkpointing=use_activation_checkpointing,
+        is_causal=is_causal
     )
     predictor = PredictorMultiSeqWrapper(predictor)
 

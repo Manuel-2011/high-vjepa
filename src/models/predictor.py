@@ -47,11 +47,13 @@ class VisionTransformerPredictor(nn.Module):
         return_all_tokens=False,
         chop_last_n_tokens=0,
         use_rope=False,
+        is_causal=False,
         **kwargs
     ):
         super().__init__()
         self.return_all_tokens = return_all_tokens
         self.chop_last_n_tokens = chop_last_n_tokens
+        self.is_causal = is_causal
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -116,6 +118,7 @@ class VisionTransformerPredictor(nn.Module):
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[i],
                     norm_layer=norm_layer,
+                    is_causal=is_causal
                 )
                 for i in range(depth)
             ]
@@ -171,20 +174,24 @@ class VisionTransformerPredictor(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def forward(self, x, masks_x, masks_y, mask_index=1, has_cls=False):
+    def forward(self, x, masks_x=None, masks_y=None, mask_index=1, has_cls=False):
         """
         :param x: context tokens
         :param masks_x: indices of context tokens in input
         :params masks_y: indices of target tokens in input
         """
-        assert (masks_x is not None) and (masks_y is not None), "Cannot run predictor without mask indices"
-        if not isinstance(masks_x, list):
-            masks_x = [masks_x]
-        if not isinstance(masks_y, list):
-            masks_y = [masks_y]
+        if not self.is_causal:
+            assert (masks_x is not None) and (masks_y is not None), "Cannot run predictor without mask indices"
+            if not isinstance(masks_x, list):
+                masks_x = [masks_x]
+            if not isinstance(masks_y, list):
+                masks_y = [masks_y]
 
         # Batch Size
-        B = len(x) // len(masks_x)
+        if self.is_causal:
+            B = len(x)
+        else:
+            B = len(x) // len(masks_x)
 
         # Map context tokens to predictor dimensions
         x = self.predictor_embed(x)
@@ -198,31 +205,32 @@ class VisionTransformerPredictor(nn.Module):
             x_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
             x += apply_masks(x_pos_embed, masks_x)
 
-        # Make target tokens
-        mask_index = mask_index % self.num_mask_tokens
-        pred_tokens = self.mask_tokens[mask_index]
-        pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)
-        pred_tokens = apply_masks(pred_tokens, masks_y)
-        # -- add pos embed
-        if not self.use_rope:
-            pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
-            pos_embs = apply_masks(pos_embs, masks_y)
-            pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
-            pred_tokens += pos_embs
+        if not self.is_causal:
+            # Make target tokens
+            mask_index = mask_index % self.num_mask_tokens
+            pred_tokens = self.mask_tokens[mask_index]
+            pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)
+            pred_tokens = apply_masks(pred_tokens, masks_y)
+            # -- add pos embed
+            if not self.use_rope:
+                pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
+                pos_embs = apply_masks(pos_embs, masks_y)
+                pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
+                pred_tokens += pos_embs
 
-        # Concatenate context & target tokens
-        x = x.repeat(len(masks_x), 1, 1)
-        x = torch.cat([x, pred_tokens], dim=1)
+            # Concatenate context & target tokens
+            x = x.repeat(len(masks_x), 1, 1)
+            x = torch.cat([x, pred_tokens], dim=1)
 
-        # Positions of context & target tokens
-        masks_x = torch.cat(masks_x, dim=0)
-        masks_y = torch.cat(masks_y, dim=0)
-        masks = torch.cat([masks_x, masks_y], dim=1)
+            # Positions of context & target tokens
+            masks_x = torch.cat(masks_x, dim=0)
+            masks_y = torch.cat(masks_y, dim=0)
+            masks = torch.cat([masks_x, masks_y], dim=1)
 
-        # Put tokens in sorted order
-        argsort = torch.argsort(masks, dim=1)  # [B, N]
-        masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
-        x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
+            # Put tokens in sorted order
+            argsort = torch.argsort(masks, dim=1)  # [B, N]
+            masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
+            x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
 
         # Remove the last n tokens of sorted sequence before processing
         if self.chop_last_n_tokens > 0:
@@ -235,16 +243,16 @@ class VisionTransformerPredictor(nn.Module):
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(blk, x, masks, None, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(blk, x, None if self.is_causal else masks, None, use_reentrant=False)
             else:
-                x = blk(x, mask=masks, attn_mask=None)
+                x = blk(x, mask=None if self.is_causal else masks, attn_mask=None)
         x = self.predictor_norm(x)
 
         if has_cls:
             x = x[:, 1:, :]
 
         # Return output corresponding to target tokens
-        if not self.return_all_tokens:
+        if not self.return_all_tokens and not self.is_causal:
             reverse_argsort = torch.argsort(argsort, dim=1)  # [B, N]
             x = torch.stack([x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0)
             x = x[:, N_ctxt:]

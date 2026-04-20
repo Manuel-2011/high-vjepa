@@ -25,11 +25,12 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
+from torch.distributed.elastic.multiprocessing.errors import record
 
 from app.vjepa.transforms import make_transforms
 from app.vjepa.utils import init_opt, init_video_model, load_checkpoint
 from src.datasets.data_manager import init_data
-from src.masks.multiseq_multiblock3d import MaskCollator
+from src.masks.multiseq_multiblock3d import MaskCollator, SimpleCollator
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
@@ -48,9 +49,7 @@ torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 
-logger = get_logger(__name__, force=True)
-
-
+@record
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -67,22 +66,14 @@ def main(args, resume_preempt=False):
     use_sdpa = cfgs_meta.get("use_sdpa", False)
     sync_gc = cfgs_meta.get("sync_gc", False)
     which_dtype = cfgs_meta.get("dtype")
-    logger.info(f"{which_dtype=}")
-    if which_dtype.lower() == "bfloat16":
-        dtype = torch.bfloat16
-        mixed_precision = True
-    elif which_dtype.lower() == "float16":
-        dtype = torch.float16
-        mixed_precision = True
-    else:
-        dtype = torch.float32
-        mixed_precision = False
+
 
     # -- MASK
     cfgs_mask = args.get("mask")
 
     # -- MODEL
     cfgs_model = args.get("model")
+    is_causal = cfgs_model.get("is_causal", False)
     compile_model = cfgs_model.get("compile_model", False)
     use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
     model_name = cfgs_model.get("model_name")
@@ -159,6 +150,20 @@ def main(args, resume_preempt=False):
 
     # -- init torch distributed backend
     world_size, rank = init_distributed()
+
+    log_file = os.path.join(folder, f"log_r{rank}.log")
+    logger = get_logger(__name__, force=True, filename=log_file)
+    logger.info(f"{which_dtype=}")
+    if which_dtype.lower() == "bfloat16":
+        dtype = torch.bfloat16
+        mixed_precision = True
+    elif which_dtype.lower() == "float16":
+        dtype = torch.float16
+        mixed_precision = True
+    else:
+        dtype = torch.float32
+        mixed_precision = False
+
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
 
     # -- set device
@@ -218,6 +223,7 @@ def main(args, resume_preempt=False):
         wide_silu=wide_silu,
         use_rope=use_rope,
         use_activation_checkpointing=use_activation_checkpointing,
+        is_causal=is_causal
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -228,13 +234,18 @@ def main(args, resume_preempt=False):
         target_encoder.compile()
         predictor.compile()
 
-    mask_collator = MaskCollator(
-        cfgs_mask=cfgs_mask,
-        dataset_fpcs=dataset_fpcs,
-        crop_size=crop_size,
-        patch_size=patch_size,
-        tubelet_size=tubelet_size,
-    )
+    if is_causal:
+        collator = SimpleCollator(
+            dataset_fpcs=dataset_fpcs,
+        )
+    else:
+        collator = MaskCollator(
+            cfgs_mask=cfgs_mask,
+            dataset_fpcs=dataset_fpcs,
+            crop_size=crop_size,
+            patch_size=patch_size,
+            tubelet_size=tubelet_size,
+        )
     transform = make_transforms(
         random_horizontal_flip=True,
         random_resize_aspect_ratio=ar_range,
@@ -258,7 +269,7 @@ def main(args, resume_preempt=False):
         world_size=world_size,
         datasets_weights=datasets_weights,
         persistent_workers=persistent_workers,
-        collator=mask_collator,
+        collator=collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
         log_dir=None,
@@ -325,7 +336,7 @@ def main(args, resume_preempt=False):
                 scheduler.step()
                 wd_scheduler.step()
                 next(momentum_scheduler)
-                mask_collator.step()
+                collator.step()
 
     def save_checkpoint(epoch, path):
         if rank != 0:
@@ -433,19 +444,31 @@ def main(args, resume_preempt=False):
                         return h
 
                 def forward_context(c):
-                    z = encoder(c, masks_enc)
-                    z = predictor(z, masks_enc, masks_pred)
+                    if is_causal:
+                        c = [videos[:,:,:-1] for videos in c] # Take out the last timestep patches from the context patches for each set of videos
+                        z = encoder(c)
+                        z = predictor(z, is_causal=is_causal)
+                    else:
+                        z = encoder(c, masks_enc)
+                        z = predictor(z, masks_enc, masks_pred)
                     return z
 
                 def loss_fn(z, h):
-                    # Assumption: predictor will have returned only masked tokens for z
-                    h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_pred)]
+                    if is_causal:
+                        h = [hi[:,1:] for hi in h] # Remove the first patch of each video
+                    else:
+                        # Assumption: predictor will have returned only masked tokens for z
+                        h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_pred)]
 
                     loss, n = 0, 0
                     for zi, hi in zip(z, h):
-                        for zij, hij in zip(zi, hi):
-                            loss += torch.mean(torch.abs(zij - hij) ** loss_exp) / loss_exp
+                        if is_causal:
+                            loss += torch.mean(torch.abs(zi - hi) ** loss_exp) / loss_exp
                             n += 1
+                        else:
+                            for zij, hij in zip(zi, hi):
+                                loss += torch.mean(torch.abs(zij - hij) ** loss_exp) / loss_exp
+                                n += 1
                     loss /= n
                     return loss
 

@@ -7,10 +7,10 @@ import importlib
 
 from src.utils.logging import get_logger
 
-logger = get_logger("Eval runner scaffold")
 
 
 def main(eval_name, args_eval, resume_preempt=False):
+    logger = get_logger("Eval runner scaffold")
     logger.info(f"Running evaluation: {eval_name}")
     if eval_name.startswith("app."):
         import_path = f"{eval_name}.eval"
