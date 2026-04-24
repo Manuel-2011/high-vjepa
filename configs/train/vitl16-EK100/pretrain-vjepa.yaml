@@ -3,23 +3,23 @@ nodes: 1
 tasks_per_node: 1
 cpus_per_task: 1
 mem_per_gpu: 46G
-folder: preliminary_experiments/EK100-long-vjepa-16f
+folder: preliminary_experiments/EK100-vjepa-16f-4pfs
 data:
   dataset_type: VideoDataset
   datasets:
-  - data/ek100_16frames_0.5fps.csv 
-  - data/ek55_16frames_0.5fps_train.csv
+  - data/ek100_16frames_4fps.csv 
+  - data/ek55_16frames_4fps_train.csv
   datasets_weights:
   - 0.5
   - 0.5
   batch_size: 128
   crop_size: 256
-  patch_size: 256
+  patch_size: 16
   dataset_fpcs:
   - 16
   - 16
-  tubelet_size: 1
-  fps: 0.5
+  tubelet_size: 2
+  fps: 4
   num_workers: 8
   persistent_workers: true
   pin_mem: true
@@ -71,7 +71,6 @@ meta:
   seed: 239
   use_sdpa: true
 model:
-  is_causal: true
   model_name: vit_large
   pred_depth: 12
   pred_embed_dim: 384
@@ -86,11 +85,11 @@ optimization:
   - 0.99925
   - 0.99925
   epochs: 10
-  final_lr: 0.001
+  final_lr: 0.000525
   final_weight_decay: 0.04
-  ipe: 73
+  ipe: 598
   ipe_scale: 1.25
-  lr: 0.001
+  lr: 0.000525
   start_lr: 0.0001
   warmup: 40
   weight_decay: 0.04
