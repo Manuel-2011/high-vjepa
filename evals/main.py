@@ -56,6 +56,7 @@ def process_main(args, rank, fname, world_size, devices):
     else:
         logger.setLevel(logging.ERROR)
 
+    logger.info(f"args passed: {args}")
     logger.info(f"called-params {fname}")
 
     # Load config

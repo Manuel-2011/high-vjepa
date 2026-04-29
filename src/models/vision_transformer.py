@@ -160,7 +160,7 @@ class VisionTransformer(nn.Module):
     def no_weight_decay(self):
         return {}
 
-    def forward(self, x, masks=None):
+    def forward(self, x, masks=None, attn_mask=None):
         """
         :param x: input image/video
         :param masks: indices of patch tokens to mask (remove)
@@ -199,10 +199,10 @@ class VisionTransformer(nn.Module):
         for i, blk in enumerate(self.blocks):
             if self.use_activation_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
-                    blk, x, masks, None, T=T, H_patches=H_patches, W_patches=W_patches, use_reentrant=False
+                    blk, x, masks, attn_mask=attn_mask, T=T, H_patches=H_patches, W_patches=W_patches, use_reentrant=False
                 )
             else:
-                x = blk(x, mask=masks, attn_mask=None, T=T, H_patches=H_patches, W_patches=W_patches)
+                x = blk(x, mask=masks, attn_mask=attn_mask, T=T, H_patches=H_patches, W_patches=W_patches)
             if self.out_layers is not None and i in self.out_layers:
                 outs.append(self.norm(x))
 

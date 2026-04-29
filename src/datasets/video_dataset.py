@@ -51,6 +51,7 @@ def make_videodataset(
     persistent_workers=True,
     deterministic=True,
     log_dir=None,
+    allow_variable_length=False,
 ):
     dataset = VideoDataset(
         data_paths=data_paths,
@@ -67,6 +68,7 @@ def make_videodataset(
         filter_long_videos=filter_long_videos,
         shared_transform=shared_transform,
         transform=transform,
+        allow_variable_length=allow_variable_length
     )
 
     log_dir = pathlib.Path(log_dir) if log_dir else None
@@ -137,6 +139,7 @@ class VideoDataset(torch.utils.data.Dataset):
         filter_short_videos=False,
         filter_long_videos=int(10**9),
         duration=None,  # duration in seconds
+        allow_variable_length=False, # Clips may have a shorter length than frames_per_clip
     ):
         self.data_paths = data_paths
         self.datasets_weights = datasets_weights
@@ -150,6 +153,7 @@ class VideoDataset(torch.utils.data.Dataset):
         self.filter_long_videos = filter_long_videos
         self.duration = duration
         self.fps = fps
+        self.allow_variable_length = allow_variable_length
 
         if sum([v is not None for v in (fps, duration, frame_step)]) != 1:
             raise ValueError(
@@ -347,10 +351,15 @@ class VideoDataset(torch.utils.data.Dataset):
                 # --
                 indices = indices + i * partition_len
             else:
+                if self.allow_variable_length:
+                    indices = np.linspace(0, partition_len, num=partition_len // fstp)
+                    indices = np.clip(indices, 0, partition_len - 1).astype(np.int64)
+                    indices = indices + i * partition_len
+
                 # If partition overlap not allowed and partition_len < clip_len
                 # then repeatedly append the last frame in the segment until
                 # we reach the desired clip length
-                if not self.allow_clip_overlap:
+                elif not self.allow_clip_overlap:
                     indices = np.linspace(0, partition_len, num=partition_len // fstp)
                     indices = np.concatenate(
                         (

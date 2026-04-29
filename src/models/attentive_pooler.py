@@ -88,15 +88,17 @@ class AttentivePooler(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         if self.blocks is not None:
             for blk in self.blocks:
                 if self.use_activation_checkpointing:
-                    x = torch.utils.checkpoint.checkpoint(blk, x, False, None, use_reentrant=False)
+                    x = torch.utils.checkpoint.checkpoint(blk, x, False, attn_mask, use_reentrant=False)
                 else:
-                    x = blk(x)
+                    x = blk(x, attn_mask=attn_mask)
         q = self.query_tokens.repeat(len(x), 1, 1)
-        q = self.cross_attention_block(q, x)
+        if attn_mask is not None:
+            attn_mask = attn_mask[:,:,:1]
+        q = self.cross_attention_block(q, x, attn_mask=attn_mask)
         return q
 
 
@@ -112,7 +114,7 @@ class AttentiveClassifier(nn.Module):
         norm_layer=nn.LayerNorm,
         init_std=0.02,
         qkv_bias=True,
-        num_classes=1000,
+        num_classes=1000, # Can also be a list in the case of multiple classification heads per task
         complete_block=True,
         use_activation_checkpointing=False,
     ):
@@ -129,9 +131,18 @@ class AttentiveClassifier(nn.Module):
             complete_block=complete_block,
             use_activation_checkpointing=use_activation_checkpointing,
         )
-        self.linear = nn.Linear(embed_dim, num_classes, bias=True)
+        if isinstance(num_classes, list):
+            self.heads = nn.ModuleList([nn.Linear(embed_dim, classes, bias=True) for classes in num_classes])
+        else:
+            self.linear = nn.Linear(embed_dim, num_classes, bias=True)
 
-    def forward(self, x):
-        x = self.pooler(x).squeeze(1)
+    def forward(self, x, attn_mask=None):
+        x = self.pooler(x, attn_mask=attn_mask).squeeze(1)
+        if hasattr(self, 'heads'):
+            logits_per_class = []
+            for head in self.heads:
+                logits_per_class.append(head(x))
+            return logits_per_class
+        
         x = self.linear(x)
         return x

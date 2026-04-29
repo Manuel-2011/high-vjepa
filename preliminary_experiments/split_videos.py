@@ -7,7 +7,7 @@ input_root = Path("data/ek55_processed/train")
 
 frames_num = 16
 original_fps = 4
-desired_fps = 4
+desired_fps = 0.5
 
 # Output dataset root
 output_root = Path(f"data/ek55_{frames_num }frames_{desired_fps}fps_train")
@@ -39,6 +39,12 @@ def process_video(video_path, output_base_dir):
         indices = np.linspace(i, i + clip_len, num=frames_num, endpoint=False).astype(np.int64)
 
         if indices[-1] < len(vr):
+            fname = base_fname.format(i // clip_len)
+            save_path = output_base_dir / fname
+
+            if save_path.exists():
+                continue
+
             try:
                 frames = vr.get_batch(indices)
             except Exception as e:
@@ -49,8 +55,6 @@ def process_video(video_path, output_base_dir):
                 print(f"Frame mismatch in {video_path}")
                 continue
 
-            fname = base_fname.format(i // clip_len)
-            save_path = output_base_dir / fname
 
             # np.save(save_path, frames.asnumpy())
             # Export the video

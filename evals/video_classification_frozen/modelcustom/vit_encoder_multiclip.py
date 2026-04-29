@@ -47,7 +47,7 @@ def init_module(
     wrapper_kwargs: dict,
 ):
     logger.info(f"Loading pretrained model from {checkpoint}")
-    checkpoint = torch.load(checkpoint, map_location="cpu")
+    checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=True)
 
     enc_kwargs = model_kwargs["encoder"]
     enc_ckp_key = enc_kwargs.get("checkpoint_key")
@@ -104,7 +104,7 @@ class ClipAggregation(nn.Module):
             sincos = get_1d_sincos_pos_embed(embed_dim, max_T)
             self.pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
 
-    def forward(self, x, clip_indices=None):
+    def forward(self, x, clip_indices=None, attn_mask=None):
 
         num_clips = len(x)
         num_views_per_clip = len(x[0])
@@ -114,9 +114,13 @@ class ClipAggregation(nn.Module):
         x = [torch.cat(xi, dim=0) for xi in x]
         x = torch.cat(x, dim=0)
 
-        outputs = self.model(x)
+        if attn_mask is not None:
+            attn_mask = [torch.cat(xi, dim=0) for xi in attn_mask]
+            attn_mask = torch.cat(attn_mask, dim=0)
 
-        def multiviews_postprocess(outputs):
+        outputs = self.model(x, attn_mask=attn_mask)
+
+        def multiviews_postprocess(outputs, attn_mask=None):
             _, N, D = outputs.size()
             T = F // self.tubelet_size  # num temporal indices
             S = N // T  # num spatial tokens
@@ -124,15 +128,21 @@ class ClipAggregation(nn.Module):
             # Unroll outputs into a 2D array [spatial_views x temporal_views]
             eff_B = B * num_views_per_clip
             all_outputs = [[] for _ in range(num_views_per_clip)]
+            all_attn_masks = [[] for _ in range(num_views_per_clip)]
             for i in range(num_clips):
                 o = outputs[i * eff_B : (i + 1) * eff_B]
+                if attn_mask is not None:
+                    clip_attn_mask = attn_mask[i * eff_B : (i + 1) * eff_B]
                 for j in range(num_views_per_clip):
                     all_outputs[j].append(o[j * B : (j + 1) * B])
+                    if attn_mask is not None:
+                        all_attn_masks[j].append(clip_attn_mask[j * B : (j + 1) * B])
 
-            for i, outputs in enumerate(all_outputs):
+            for i, (outputs, view_attn_mask) in enumerate(zip(all_outputs, all_attn_masks)):
                 # Concatenate along temporal dimension
                 outputs = [o.reshape(B, T, S, D) for o in outputs]
                 outputs = torch.cat(outputs, dim=1).flatten(1, 2)
+                clip_attn_masks = torch.stack(view_attn_mask, dim=2).reshape(B, 1, num_clips*T*S, num_clips*T*S)
                 # Compute positional embedding
                 if (self.pos_embed is not None) and (clip_indices is not None):
                     _indices = [c[:, :: self.tubelet_size] for c in clip_indices]
@@ -143,7 +153,8 @@ class ClipAggregation(nn.Module):
                     pos_embed = pos_embed.flatten(1, 2)
                     outputs += pos_embed
                 all_outputs[i] = outputs
+                all_attn_masks[i] = clip_attn_masks
 
-            return all_outputs
+            return all_outputs, all_attn_masks
 
-        return multiviews_postprocess(outputs)
+        return multiviews_postprocess(outputs, attn_mask)

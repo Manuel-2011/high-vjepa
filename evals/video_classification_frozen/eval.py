@@ -31,7 +31,7 @@ from src.datasets.data_manager import init_data
 from src.models.attentive_pooler import AttentiveClassifier
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.distributed import AllReduce, init_distributed
-from src.utils.logging import AverageMeter, CSVLogger
+from src.utils.logging import AverageMeter, CSVLogger, get_logger
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -46,7 +46,7 @@ pp = pprint.PrettyPrinter(indent=4)
 
 
 def main(args_eval, resume_preempt=False):
-
+    global logger
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
     # ----------------------------------------------------------------------- #
@@ -89,6 +89,7 @@ def main(args_eval, resume_preempt=False):
     duration = args_data.get("clip_duration", None)
     num_views_per_segment = args_data.get("num_views_per_segment", 1)
     normalization = args_data.get("normalization", None)
+    allow_variable_length = args_data.get("allow_variable_length", False)
 
     # -- OPTIMIZATION
     args_opt = args_exp.get("optimization")
@@ -133,7 +134,12 @@ def main(args_eval, resume_preempt=False):
 
     # -- make csv_logger
     if rank == 0:
-        csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%.5f", "train_acc"), ("%.5f", "val_acc"))
+        if isinstance(num_classes, list):
+            csv_logger = CSVLogger(log_file, ("%d", "epoch"), *[("%.5f", f"train_acc_task_{i}") for i in range(len(num_classes))], *[("%.5f", f"val_acc_task_{i}") for i in range(len(num_classes))])
+        else:
+            csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%.5f", "train_acc"), ("%.5f", "val_acc"))
+        log_file = os.path.join(folder, f"log_r{rank}.log")
+        logger = get_logger(__name__, force=True, filename=log_file)
 
     # Initialize model
 
@@ -147,6 +153,8 @@ def main(args_eval, resume_preempt=False):
         wrapper_kwargs=args_wrapper,
         device=device,
     )
+
+    logger.info("Loaded pre-trained encoder")
     # -- init classifier
     classifiers = [
         AttentiveClassifier(
@@ -158,6 +166,7 @@ def main(args_eval, resume_preempt=False):
         ).to(device)
         for _ in opt_kwargs
     ]
+    logger.info(f"Loaded classifiers, number: {len(classifiers)}")
     classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
     print(classifiers[0])
 
@@ -177,6 +186,9 @@ def main(args_eval, resume_preempt=False):
         training=True,
         num_workers=num_workers,
         normalization=normalization,
+        patch_size=args_model['encoder']['patch_size'],
+        allow_variable_length=allow_variable_length,
+        tubelet_size=args_model['encoder']['tubelet_size'],
     )
     val_loader, _ = make_dataloader(
         dataset_type=dataset_type,
@@ -194,6 +206,9 @@ def main(args_eval, resume_preempt=False):
         training=False,
         num_workers=num_workers,
         normalization=normalization,
+        patch_size=args_model['encoder']['patch_size'],
+        allow_variable_length=allow_variable_length,
+        tubelet_size=args_model['encoder']['tubelet_size'],
     )
     ipe = len(train_loader)
     logger.info(f"Dataloader created... iterations per epoch: {ipe}")
@@ -255,6 +270,7 @@ def main(args_eval, resume_preempt=False):
                 wd_scheduler=wd_scheduler,
                 data_loader=train_loader,
                 use_bfloat16=use_bfloat16,
+                num_classes=num_classes,
             )
 
         val_acc = run_one_epoch(
@@ -268,11 +284,18 @@ def main(args_eval, resume_preempt=False):
             wd_scheduler=wd_scheduler,
             data_loader=val_loader,
             use_bfloat16=use_bfloat16,
+            num_classes=num_classes,
         )
 
-        logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
-        if rank == 0:
-            csv_logger.log(epoch + 1, train_acc, val_acc)
+        if isinstance(num_classes, list):
+            logger.info(("[%5d] train:" % (epoch+1)) + (" %.3f%%"*len(num_classes) % tuple(train_acc)) + " test:" + " %.3f%%"*len(num_classes) % tuple(val_acc))
+            if rank == 0:
+                csv_logger.log(epoch + 1, *train_acc, *val_acc)
+
+        else:
+            logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
+            if rank == 0:
+                csv_logger.log(epoch + 1, train_acc, val_acc)
 
         if val_only:
             return
@@ -291,6 +314,7 @@ def run_one_epoch(
     wd_scheduler,
     data_loader,
     use_bfloat16,
+    num_classes,
 ):
 
     for c in classifiers:
@@ -298,6 +322,8 @@ def run_one_epoch(
 
     criterion = torch.nn.CrossEntropyLoss()
     top1_meters = [AverageMeter() for _ in classifiers]
+    if isinstance(num_classes, list):
+        top1_meters = [[AverageMeter() for _ in classifiers] for _ in num_classes]
     for itr, data in enumerate(data_loader):
         if training:
             [s.step() for s in scheduler]
@@ -309,27 +335,31 @@ def run_one_epoch(
                 [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
                 for di in data[0]  # iterate over temporal index of clip
             ]
-            clip_indices = [d.to(device, non_blocking=True) for d in data[2]]
+            clip_indices = data[2]
+            if clip_indices is not None:
+                clip_indices = [d.to(device, non_blocking=True) for d in data[2]]
             labels = data[1].to(device)
+            attn_mask = [
+                [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
+                for di in data[3]  # iterate over temporal index of clip
+            ]
             batch_size = len(labels)
+            if len(labels.shape) == 2:
+                batch_size = labels.shape[1]
 
             # Forward and prediction
             with torch.no_grad():
-                outputs = encoder(clips, clip_indices)
+                outputs, attn_mask = encoder(clips, clip_indices, attn_mask) # clips are concat along the T dim and views ake kept separate in a list
                 if not training:
-                    outputs = [[c(o) for o in outputs] for c in classifiers]
+                    outputs = [[c(o, attn_mask=view_attn_mask) for o, view_attn_mask in zip(outputs, attn_mask)] for c in classifiers]
             if training:
-                outputs = [[c(o) for o in outputs] for c in classifiers]
+                outputs = [[c(o, attn_mask=view_attn_mask) for o, view_attn_mask in zip(outputs, attn_mask)] for c in classifiers]
 
         # Compute loss
-        losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]
-        with torch.no_grad():
-            outputs = [sum([F.softmax(o, dim=1) for o in coutputs]) / len(coutputs) for coutputs in outputs]
-            top1_accs = [100.0 * coutputs.max(dim=1).indices.eq(labels).sum() / batch_size for coutputs in outputs]
-            top1_accs = [float(AllReduce.apply(t1a)) for t1a in top1_accs]
-            for t1m, t1a in zip(top1_meters, top1_accs):
-                t1m.update(t1a)
-
+        if isinstance(num_classes, list):
+            losses = [[sum([criterion(class_out, labels[i]) for i, class_out in enumerate(view_output)]) for view_output in coutputs] for coutputs in outputs] # task losses are added up so they have the same weight
+        else:
+            losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]
         if training:
             if use_bfloat16:
                 [[s.scale(lij).backward() for lij in li] for s, li in zip(scaler, losses)]
@@ -340,20 +370,63 @@ def run_one_epoch(
                 [o.step() for o in optimizer]
             [o.zero_grad() for o in optimizer]
 
-        _agg_top1 = np.array([t1m.avg for t1m in top1_meters])
-        if itr % 10 == 0:
-            logger.info(
-                "[%5d] %.3f%% [%.3f%% %.3f%%] [mem: %.2e]"
-                % (
-                    itr,
-                    _agg_top1.max(),
-                    _agg_top1.mean(),
-                    _agg_top1.min(),
-                    torch.cuda.max_memory_allocated() / 1024.0**2,
-                )
-            )
+        # Stats
+        with torch.no_grad():
+            if isinstance(num_classes, list):
+                outputs_ = [[[] for _ in range(len(outputs))] for _ in num_classes]
+                for c, (classifier_output) in enumerate(outputs):
+                    for v, view_output in enumerate(classifier_output):
+                        for t, task_output in enumerate(view_output):
+                            outputs_[t][c].append(F.softmax(task_output, dim=1))
+                    for t in range(len(num_classes)):
+                        outputs_[t][c] = sum(outputs_[t][c]) / len(outputs_[t][c])
+                
+                top1_accs = [[100.0 * classifier_output.max(dim=1).indices.eq(labels[t]).sum() / batch_size for classifier_output in task_outputs] for t,task_outputs in enumerate(outputs_)]
+                top1_accs = [[float(AllReduce.apply(t1a)) for t1a in task] for task in top1_accs]
+                for t1m_task, t1a_task in zip(top1_meters, top1_accs):
+                    for t1m, t1a in zip(t1m_task, t1a_task):
+                        t1m.update(t1a)
 
-    return _agg_top1.max()
+                _agg_top1_per_task = [np.array([t1m.avg for t1m in task_top1_meters]) for task_top1_meters in top1_meters]
+                if itr % 10 == 0:
+                    for t,_agg_top1 in enumerate(_agg_top1_per_task):
+                        logger.info(
+                            "[%5d] [Task: %d] %.3f%% [%.3f%% %.3f%%] [mem: %.2e]"
+                            % (
+                                itr,
+                                t,
+                                _agg_top1.max(),
+                                _agg_top1.mean(),
+                                _agg_top1.min(),
+                                torch.cuda.max_memory_allocated() / 1024.0**2,
+                            )
+                        )
+
+                
+            else:
+                outputs = [sum([F.softmax(o, dim=1) for o in coutputs]) / len(coutputs) for coutputs in outputs]
+                top1_accs = [100.0 * coutputs.max(dim=1).indices.eq(labels).sum() / batch_size for coutputs in outputs]
+                top1_accs = [float(AllReduce.apply(t1a)) for t1a in top1_accs]
+                for t1m, t1a in zip(top1_meters, top1_accs):
+                    t1m.update(t1a)
+
+                _agg_top1 = np.array([t1m.avg for t1m in top1_meters])
+                if itr % 10 == 0:
+                    logger.info(
+                        "[%5d] %.3f%% [%.3f%% %.3f%%] [mem: %.2e]"
+                        % (
+                            itr,
+                            _agg_top1.max(),
+                            _agg_top1.mean(),
+                            _agg_top1.min(),
+                            torch.cuda.max_memory_allocated() / 1024.0**2,
+                        )
+                        )
+                
+    if isinstance(num_classes, list):
+        return [_agg_top1.max() for _agg_top1 in _agg_top1_per_task]
+    else:
+        return _agg_top1.max()
 
 
 def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
@@ -410,6 +483,58 @@ def load_pretrained(encoder, pretrained, checkpoint_key="target_encoder"):
 
 DEFAULT_NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
+# Create a collator that mask missing patches for the attention mechanism
+class AttnMaskCollator:
+    def __init__(self, patch_size: int, tubelet_size:int):
+        self.patch_size = patch_size
+        self.tubelet_size = tubelet_size
+    
+    def __call__(self, batch): # 
+        # batch: [(buffer, label, clip_indices)]
+        # buffer: list of clips. Clip: list of views. View: [3 T H W]
+        batch_size = len(batch)
+        max_t = max(view.shape[1] for sample in batch for clip in sample[0] for view in clip)
+
+        
+        # Assume H, W, C are consistent
+        C, _, H, W = batch[0][0][0][0].shape
+
+        # Create padded tensor
+        videos = torch.zeros(
+            batch_size,
+            C,
+            max_t,
+            H,
+            W,
+            dtype=batch[0][0][0][0].dtype
+        )
+
+        # Create mask
+        H_patches = H//self.patch_size
+        W_patches = W//self.patch_size
+        max_t_patches = max_t//self.tubelet_size
+        frame_mask = torch.zeros(
+            batch_size,
+            1, # Dimension for attention heads
+            max_t_patches*H_patches*W_patches,
+            max_t_patches*H_patches*W_patches,
+            dtype=torch.bool
+        )
+
+        for i, x in enumerate(batch):
+            t = x[0][0][0].shape[1]
+            t_patches = t//self.tubelet_size
+
+            videos[i, :, :t] = x[0][0][0]
+            patches_num = t_patches*H_patches*W_patches
+            frame_mask[i, :patches_num, :patches_num] = True
+
+        # clip_indices = torch.utils.data.default_collate([sample[2] for sample in batch])
+        labels = torch.utils.data.default_collate([list(map(int, sample[1].split(','))) for sample in batch]) # Multi-labels should be separated by a comma
+        labels = torch.stack(labels, dim=0)
+
+        return [[videos]], labels, None, [[frame_mask]]
+
 
 def make_dataloader(
     root_path,
@@ -428,6 +553,9 @@ def make_dataloader(
     num_workers=12,
     subset_file=None,
     normalization=None,
+    patch_size=None,
+    allow_variable_length=False,
+    tubelet_size=None,
 ):
     if normalization is None:
         normalization = DEFAULT_NORMALIZATION
@@ -446,6 +574,11 @@ def make_dataloader(
         normalize=normalization,
     )
 
+    if num_views_per_segment == 1 and num_segments==1:
+        collator = AttnMaskCollator(patch_size, tubelet_size)
+    else:
+        collator = None
+
     data_loader, data_sampler = init_data(
         data=dataset_type,
         root_path=root_path,
@@ -461,6 +594,8 @@ def make_dataloader(
         num_workers=num_workers,
         drop_last=False,
         subset_file=subset_file,
+        collator=collator,
+        allow_variable_length=allow_variable_length
     )
     return data_loader, data_sampler
 
