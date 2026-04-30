@@ -388,10 +388,14 @@ class RoPEAttention(nn.Module):
             # attn_mask = attn_mask.reshape(T * H_patches * W_patches, T * H_patches * W_patches)
 
             current_patches_num = grid_depth * self.grid_size * self.grid_size
-            attn_mask = self.temp_attn_mask[:current_patches_num,:current_patches_num]
+            causal_attn_mask = self.temp_attn_mask[:current_patches_num,:current_patches_num]
+            if attn_mask is not None:
+                causal_attn_mask = causal_attn_mask.view((1,) * (attn_mask.dim() - causal_attn_mask.dim()) + causal_attn_mask.shape).to(attn_mask.dtype) # Make the casusal mask have the same number of dims as attn_mask
+                causal_attn_mask = attn_mask * causal_attn_mask
+            
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.proj_drop_prob, attn_mask=attn_mask
+                    q, k, v, dropout_p=self.proj_drop_prob, attn_mask=causal_attn_mask
                 )
                 attn = None
         else:

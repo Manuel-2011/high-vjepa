@@ -352,7 +352,7 @@ class VideoDataset(torch.utils.data.Dataset):
                 indices = indices + i * partition_len
             else:
                 if self.allow_variable_length:
-                    indices = np.linspace(0, partition_len, num=partition_len // fstp)
+                    indices = np.linspace(0, partition_len, num=max(partition_len // fstp, 1))
                     indices = np.clip(indices, 0, partition_len - 1).astype(np.int64)
                     indices = indices + i * partition_len
 

@@ -527,7 +527,7 @@ class AttnMaskCollator:
 
             videos[i, :, :t] = x[0][0][0]
             patches_num = t_patches*H_patches*W_patches
-            frame_mask[i, :patches_num, :patches_num] = True
+            frame_mask[i, :, :patches_num, :patches_num] = True
 
         # clip_indices = torch.utils.data.default_collate([sample[2] for sample in batch])
         labels = torch.utils.data.default_collate([list(map(int, sample[1].split(','))) for sample in batch]) # Multi-labels should be separated by a comma
