@@ -72,6 +72,7 @@ class VisionTransformer(nn.Module):
                 patch_size=patch_size, tubelet_size=tubelet_size, in_chans=in_chans, embed_dim=embed_dim
             )
             self.num_patches = (num_frames // tubelet_size) * (img_size[0] // patch_size) * (img_size[1] // patch_size)
+            self.patches_per_frame = (img_size[0] // patch_size) * (img_size[1] // patch_size)
         else:
             self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
             self.num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)

@@ -455,7 +455,7 @@ def main(args, resume_preempt=False):
 
                 def loss_fn(z, h):
                     if is_causal:
-                        h = [hi[:,1:] for hi in h] # Remove the first patch of each video
+                        h = [hi[:,1*encoder.module.backbone.patches_per_frame:] for hi in h] # Remove the first patch of each video
                     else:
                         # Assumption: predictor will have returned only masked tokens for z
                         h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_pred)]
