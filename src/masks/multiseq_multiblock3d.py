@@ -17,10 +17,19 @@ class SimpleCollator(object):
     def __init__(
         self,
         dataset_fpcs,
+        use_pretrained_model=False,
+        previous_fps=None,
+        current_fps=None,
+        previous_tubulet_size=None,
     ):
         super(SimpleCollator, self).__init__()
 
         self.fpcs = dataset_fpcs
+        self.use_pretrained_model = use_pretrained_model
+        self.previous_fps = previous_fps
+        self.current_fps = current_fps
+        self.frames_to_skip = int(previous_fps // current_fps)
+        self.previous_tubulet_size = previous_tubulet_size
 
     def __call__(self, batch):
 
@@ -33,6 +42,8 @@ class SimpleCollator(object):
                 # Video sample: sample[-1] is clip_indices, sample[-1][-1] contains frame indices
                 try:
                     fpc = len(sample[-1][-1])
+                    if self.use_pretrained_model:
+                        fpc = int((fpc // self.frames_to_skip)*self.previous_tubulet_size)
                 except (TypeError, IndexError):
                     # Fallback: assume single frame if structure is unexpected
                     fpc = 1
@@ -49,6 +60,23 @@ class SimpleCollator(object):
             if batch_size == 0:
                 continue
             collated_batch = torch.utils.data.default_collate(fpc_batch)
+
+            # ignore intermediate frames that are not needed
+            # and keep consecutive frames to complete the tubulet
+            if self.use_pretrained_model:
+                videos, labels, ids = collated_batch
+                for i in range(len(videos)):
+                    B, C, T, H, W = videos[i].shape
+                    videos[i] = (
+                        videos[i].view(B, C, T//self.frames_to_skip, self.frames_to_skip, H, W)[:, :, :, :self.previous_tubulet_size, :, :]
+                        .reshape(B, C, T//self.frames_to_skip * self.previous_tubulet_size, H, W)
+                    )
+                
+                    ids[i] = (
+                        ids[i].view(B, T//self.frames_to_skip, self.frames_to_skip)[:, :, :self.previous_tubulet_size]
+                        .reshape(B, T//self.frames_to_skip * self.previous_tubulet_size)
+                    )
+                collated_batch = [videos, labels, ids]
             collated_masks_pred, collated_masks_enc = [], []
             fpc_collations += [
                 (collated_batch, collated_masks_enc, collated_masks_pred)

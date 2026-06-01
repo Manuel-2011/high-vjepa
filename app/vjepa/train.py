@@ -137,6 +137,11 @@ def main(args, resume_preempt=False):
     ema = cfgs_opt.get("ema")
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     eps = cfgs_opt.get("eps", 1.0e-8)
+
+    # -- USE PRE-TRAINED MODEL
+    cfgs_use_pretrained_model = cfgs_meta.get("use_pretrained_model")
+    use_pretrained_model = cfgs_use_pretrained_model.get("enabled", False)
+    previous_fps = cfgs_use_pretrained_model.get("previous_fps", None)
     # ----------------------------------------------------------------------- #
     # ----------------------------------------------------------------------- #
 
@@ -237,6 +242,10 @@ def main(args, resume_preempt=False):
     if is_causal:
         collator = SimpleCollator(
             dataset_fpcs=dataset_fpcs,
+            use_pretrained_model=use_pretrained_model,
+            previous_fps=previous_fps,
+            current_fps=fps,
+            previous_tubulet_size=tubelet_size,
         )
     else:
         collator = MaskCollator(
@@ -257,13 +266,16 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
+    if use_pretrained_model:
+        frames_to_skip = previous_fps // fps
+        dataset_fpcs_to_extract = [int(fpc*frames_to_skip/tubelet_size) for fpc in dataset_fpcs]
     (unsupervised_loader, unsupervised_sampler) = init_data(
         data=dataset_type,
         root_path=dataset_paths,
         batch_size=batch_size,
         training=True,
-        dataset_fpcs=dataset_fpcs,
-        fps=fps,
+        dataset_fpcs=dataset_fpcs_to_extract if use_pretrained_model else dataset_fpcs,
+        fps=previous_fps if use_pretrained_model else fps,
         transform=transform,
         rank=rank,
         world_size=world_size,
