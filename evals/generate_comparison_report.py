@@ -268,6 +268,7 @@ def load_data_for_model(config: dict, data_path: str):
         patch_size=args_model['encoder']['patch_size'],
         allow_variable_length=allow_variable_length,
         tubelet_size=args_model['encoder']['tubelet_size'],
+        shuffle=False,
     )
     
     return val_loader
