@@ -556,6 +556,7 @@ def make_dataloader(
     patch_size=None,
     allow_variable_length=False,
     tubelet_size=None,
+    shuffle=True,
 ):
     if normalization is None:
         normalization = DEFAULT_NORMALIZATION
@@ -595,7 +596,8 @@ def make_dataloader(
         drop_last=False,
         subset_file=subset_file,
         collator=collator,
-        allow_variable_length=allow_variable_length
+        allow_variable_length=allow_variable_length,
+        shuffle=shuffle
     )
     return data_loader, data_sampler
 
