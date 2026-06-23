@@ -199,7 +199,6 @@ def load_model_checkpoint(config: dict, encoder_emb_dim: int, device: str = "cud
             )
             classifier.load_state_dict(state_dict, strict=False)
             classifiers.append(classifier.to(device))
-            break # TODO: Only loading one classifier
     
     return classifiers
 
@@ -702,15 +701,21 @@ def main():
                         for t in range(len(num_classes)):
                             outputs_[t][c] = sum(outputs_[t][c]) / len(outputs_[t][c])
 
-                    for task_output, task in zip(outputs_, ['verbs', 'nouns']):
-                        for classifier_output in task_output:
-                            values, indices = torch.sort(classifier_output, dim=1, descending=True)
-                            
-                            for i in range(10): # batch size
-                                predictions_all_models[model_name][task].extend([zip(indices[i,:5].cpu().tolist(), values[i,:5].cpu().tolist())])
-                            
-                            # TODO: use the best classifier
-                            break  # Use first classifier if multiple
+                    best_classifiers = []
+                    for i, (task_output, task) in enumerate(zip(outputs_, ['verbs', 'nouns'])):
+                        classifiers_num = len(task_output)
+                        classifiers_output = torch.stack(task_output, dim=0)
+                        classifiers_output_perf = torch.gather(classifiers_output, 2, labels[i].unsqueeze(0).unsqueeze(2).repeat(classifiers_num,1,1))
+                        classifiers_output_perf = classifiers_output_perf.mean(dim=0).squeeze()
+                        best_classifier = torch.argmax(classifiers_output_perf)
+                        best_classifiers.append(classifiers_output[best_classifier])
+
+                    for task_output, task in zip(best_classifiers, ['verbs', 'nouns']):
+                        values, indices = torch.sort(task_output, dim=1, descending=True)
+                        
+                        for i in range(10): # batch size
+                            predictions_all_models[model_name][task].extend([zip(indices[i,:5].cpu().tolist(), values[i,:5].cpu().tolist())])
+                        
                     
                 except Exception as e:
                     logger.error(f"    ✗ {model_name}: {e}")
