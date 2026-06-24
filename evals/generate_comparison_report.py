@@ -28,17 +28,44 @@ from decord import cpu, VideoReader
 from PIL import Image
 import imageio
 import importlib
+from tqdm import tqdm
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Add project to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+
+def configure_logging(log_path: str):
+    """Configure logging to both console and file."""
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    # Clear existing handlers to prevent duplicate log entries when re-running
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+
+    file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    # Also capture warnings through logging
+    logging.captureWarnings(True)
+
+
 from src.datasets.video_dataset import make_videodataset
 from evals.video_classification_frozen.utils import make_transforms
 from evals.video_classification_frozen.eval import make_dataloader
+from evals.video_classification_frozen.eval import load_pretrained
+from evals.video_classification_frozen.models import init_module
 
 # ============================================================================
 # Configuration
@@ -195,47 +222,20 @@ def load_model_checkpoint(config: dict, encoder_emb_dim: int, device: str = "cud
                 num_heads=num_heads,
                 depth=num_probe_blocks,
                 num_classes=num_classes,
-                use_activation_checkpointing=True,
             )
-            classifier.load_state_dict(state_dict, strict=False)
+            state_dict = {
+                k.replace("module.", "", 1): v
+                for k, v in state_dict.items()
+            }
+            msg = classifier.load_state_dict(state_dict)
+            logger.info(f"loaded pretrained classifier with msg: {msg}")
+            classifier.train(mode=False)
             classifiers.append(classifier.to(device))
     
     return classifiers
 
 
-def init_encoder(config: Dict, device: str = "cuda:0") -> torch.nn.Module:
-    """Initialize and load encoder model."""
-    args_pretrain = config.get("model_kwargs", {})
-    checkpoint = args_pretrain.get("checkpoint")
-    module_name = args_pretrain.get("module_name")
-    args_model = args_pretrain.get("pretrain_kwargs", {})
-    args_wrapper = args_pretrain.get("wrapper_kwargs", {})
-    
-    args_exp = config.get("experiment", {})
-    args_data = args_exp.get("data", {})
-    frames_per_clip = args_data.get("frames_per_clip", 16)
-    resolution = args_data.get("resolution", 256)
-    
-    # Dynamically import and initialize the encoder module
-    try:
-        encoder_module = importlib.import_module(module_name)
-        encoder = encoder_module.init_module(
-            frames_per_clip=frames_per_clip,
-            resolution=resolution,
-            checkpoint=checkpoint,
-            model_kwargs=args_model,
-            wrapper_kwargs=args_wrapper,
-        ).to(device)
-        encoder.eval()
-        for p in encoder.parameters():
-            p.requires_grad = False
-        return encoder
-    except Exception as e:
-        logger.error(f"Failed to initialize encoder: {e}")
-        raise
-
-
-def load_data_for_model(config: dict, data_path: str):
+def load_data_for_model(config: dict, data_path: str, batch_size: int):
     args_data = config['experiment'].get("data")
     dataset_type = args_data.get("dataset_type", "VideoDataset")
     resolution = args_data.get("resolution", 224)
@@ -258,11 +258,11 @@ def load_data_for_model(config: dict, data_path: str):
         eval_duration=duration,
         num_views_per_segment=1,
         allow_segment_overlap=True,
-        batch_size=10,
+        batch_size=batch_size,
         world_size=1,
         rank=0,
         training=False,
-        num_workers=1,
+        num_workers=16,
         normalization=normalization,
         patch_size=args_model['encoder']['patch_size'],
         allow_variable_length=allow_variable_length,
@@ -296,42 +296,6 @@ def load_video_frames(video_path: str, frames_per_clip: int = 16, frame_step: in
     except Exception as e:
         logger.warning(f"Failed to load video {video_path}: {e}")
         return None
-
-# TODO: Check this is done the same way the batch loader does it
-def preprocess_frames(frames: np.ndarray, resolution: int = 256) -> torch.Tensor:
-    """Preprocess frames for model input (validation transforms)."""
-    # Center crop to resolution x resolution
-    h, w = frames.shape[1], frames.shape[2]
-    if h != resolution or w != resolution:
-        # Simple center crop
-        top = (h - resolution) // 2
-        left = (w - resolution) // 2
-        frames = frames[:, top:top+resolution, left:left+resolution, :]
-    
-    # Convert to tensor and normalize
-    frames_tensor = torch.from_numpy(frames).float() / 255.0  # [T, H, W, 3]
-    frames_tensor = frames_tensor.permute(0, 3, 1, 2)  # [T, C, H, W]
-    
-    # ImageNet normalization
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-    frames_tensor = (frames_tensor - mean) / std
-    
-    # Rearrange to [C, T, H, W] for ViT input
-    frames_tensor = frames_tensor.permute(1, 0, 2, 3)
-    
-    return frames_tensor.unsqueeze(0)  # Add batch dimension [1, C, T, H, W]
-
-
-def get_top_k_predictions(logits: torch.Tensor, k: int = 5) -> Tuple[List[int], List[float]]:
-    """Get top-k predictions with confidence scores."""
-    probs = F.softmax(logits, dim=1)
-    top_k_probs, top_k_indices = torch.topk(probs, k, dim=1)
-    
-    indices = top_k_indices[0].cpu().numpy().tolist()
-    confidences = top_k_probs[0].cpu().numpy().tolist()
-    
-    return indices, confidences
 
 
 def generate_gif(frames: np.ndarray, output_path: str, fps: float = 10.0):
@@ -611,13 +575,16 @@ def generate_html_report(
 
 def main():
     """Main evaluation pipeline."""
-    # Setup device
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Using device: {device}")
-    
     # Create output directory
     output_dir = Path("preliminary_experiments/evals/vitl/vjepa_ek100_ar/qualitative_eval")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure logging before emitting output
+    configure_logging(str(output_dir / "comparison_qualitative_report.log"))
+
+    # Setup device
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
     
     # Download class labels
     verb_labels = download_class_labels(
@@ -652,7 +619,16 @@ def main():
     for model_cfg in MODELS_CONFIG:
         try:
             config = load_config(model_cfg["config"])
-            encoder = init_encoder(config, device=device)
+            encoder = init_module(
+                config['model_kwargs']['module_name'],
+                device,
+                config['experiment']['data']['frames_per_clip'],
+                config['experiment']['data']['resolution'],
+                config['model_kwargs']['checkpoint'],
+                config['model_kwargs']['pretrain_kwargs'],
+                config['model_kwargs']['wrapper_kwargs'],
+            )
+            
             classifiers = load_model_checkpoint(config, encoder.embed_dim, device=device)
             model_name = model_cfg["name"]
             models_data.append({
@@ -665,7 +641,8 @@ def main():
             continue
         
         # Load data
-        data_loader = load_data_for_model(config, data_path)
+        data_loader = load_data_for_model(config, data_path, batch_size=10)
+
 
         # Forward pass through encoder
         num_classes = config['experiment']['data']['num_classes']
@@ -673,7 +650,12 @@ def main():
                         "verbs": [],
                         "nouns": [],
                     }
-        for itr, data in enumerate(data_loader):
+        
+        for itr, data in tqdm(
+            enumerate(data_loader),
+            total=len(data_loader),
+            desc="Processing"
+        ):
             with torch.no_grad():
                 try:
                     # Load data and put on GPU
@@ -684,7 +666,7 @@ def main():
                     clip_indices = data[2]
                     if clip_indices is not None:
                         clip_indices = [d.to(device, non_blocking=True) for d in data[2]]
-                    labels = data[1].to(device)
+                    labels = data[1] # Loaded in CPU
                     attn_mask = [
                         [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
                         for di in data[3]  # iterate over temporal index of clip
@@ -704,16 +686,17 @@ def main():
                     best_classifiers = []
                     for i, (task_output, task) in enumerate(zip(outputs_, ['verbs', 'nouns'])):
                         classifiers_num = len(task_output)
-                        classifiers_output = torch.stack(task_output, dim=0)
-                        classifiers_output_perf = torch.gather(classifiers_output, 2, labels[i].unsqueeze(0).unsqueeze(2).repeat(classifiers_num,1,1))
-                        classifiers_output_perf = classifiers_output_perf.mean(dim=0).squeeze()
-                        best_classifier = torch.argmax(classifiers_output_perf)
+                        classifiers_output = torch.stack(task_output, dim=0).cpu()
+                        # classifiers_output_perf = torch.gather(classifiers_output, 2, labels[i].unsqueeze(0).unsqueeze(2).repeat(classifiers_num,1,1))
+                        classifiers_output_perf = (torch.argmax(classifiers_output, dim=2) == labels[i]).sum(dim=1) / classifiers_output.shape[1]
+                        # classifiers_output_perf = classifiers_output_perf.squeeze().mean(dim=1)
+                        best_classifier = np.nanargmax(classifiers_output_perf)
                         best_classifiers.append(classifiers_output[best_classifier])
 
                     for task_output, task in zip(best_classifiers, ['verbs', 'nouns']):
                         values, indices = torch.sort(task_output, dim=1, descending=True)
                         
-                        for i in range(10): # batch size
+                        for i in range(len(indices)): # batch size
                             predictions_all_models[model_name][task].extend([zip(indices[i,:5].cpu().tolist(), values[i,:5].cpu().tolist())])
                         
                     
@@ -739,7 +722,7 @@ def main():
         noun_id = str(sample_row["noun_id"])
         
         # Load frames
-        frames = load_video_frames(video_path, frames_per_clip=16, frame_step=1)
+        frames = load_video_frames(video_path, frames_per_clip=32, frame_step=1)
         if frames is None:
             logger.warning(f"Skipping video {video_path}")
             continue
