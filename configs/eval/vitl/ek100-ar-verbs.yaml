@@ -3,10 +3,10 @@ eval_name: video_classification_frozen
 folder: preliminary_experiments/evals/vitl/vjepa_ek100_ar
 mem_per_gpu: 12G
 nodes: 1
-max_workers: 2
-num_workers: 2
+max_workers: 8
+num_workers: 8
 resume_checkpoint: true
-tag: high-vjepa_ek100_ar_post_trained
+tag: vjepa_ek100_ar_verbs
 tasks_per_node: 1
 experiment:
   classifier:
@@ -14,13 +14,11 @@ experiment:
     num_probe_blocks: 4
   data:
     dataset_type: VideoDataset
-    dataset_train: data/EK100_action_recognition_train.csv
-    dataset_val: data/EK100_action_recognition_validation.csv
+    dataset_train: data/EK100_action_recognition_train_verbs.csv
+    dataset_val: data/EK100_action_recognition_validation_verbs.csv
     frame_step: 1 # Videos have 4 fps
     frames_per_clip: 16
-    num_classes:
-    - 97
-    - 305
+    num_classes: 97
     num_segments: 1
     num_views_per_segment: 1
     resolution: 256
@@ -158,7 +156,7 @@ experiment:
     use_bfloat16: true
     use_pos_embed: false
 model_kwargs:
-  checkpoint: preliminary_experiments/EK100-long-vjepa-16f-16x16_post_training/latest.pt
+  checkpoint: preliminary_experiments/EK100-vjepa-16f-4pfs/latest.pt
   module_name: evals.video_classification_frozen.modelcustom.vit_encoder_multiclip
   pretrain_kwargs:
     encoder:

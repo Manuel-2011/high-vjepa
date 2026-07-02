@@ -3,10 +3,10 @@ eval_name: video_classification_frozen
 folder: preliminary_experiments/evals/vitl/vjepa_ek100_ar
 mem_per_gpu: 12G
 nodes: 1
-max_workers: 2
-num_workers: 2
+max_workers: 4
+num_workers: 4
 resume_checkpoint: true
-tag: high-vjepa_ek100_ar_post_trained
+tag: high-vjepa_ek100_ar_4ps
 tasks_per_node: 1
 experiment:
   classifier:
@@ -158,17 +158,18 @@ experiment:
     use_bfloat16: true
     use_pos_embed: false
 model_kwargs:
-  checkpoint: preliminary_experiments/EK100-long-vjepa-16f-16x16_post_training/latest.pt
+  checkpoint: preliminary_experiments/EK100-long-vjepa-16f/latest.pt
   module_name: evals.video_classification_frozen.modelcustom.vit_encoder_multiclip
   pretrain_kwargs:
     encoder:
       checkpoint_key: target_encoder
       img_temporal_dim_size: null
       model_name: vit_large
-      patch_size: 16
-      tubelet_size: 2
+      patch_size: 256
+      tubelet_size: 1
       uniform_power: true
       use_rope: true
+      is_causal: true
   wrapper_kwargs:
     max_frames: 16
     use_pos_embed: false

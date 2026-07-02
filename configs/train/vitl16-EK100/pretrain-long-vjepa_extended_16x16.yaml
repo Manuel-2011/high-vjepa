@@ -7,12 +7,12 @@ folder: preliminary_experiments/EK100-long-vjepa-16f-16x16
 data:
   dataset_type: VideoDataset
   datasets:
-  - data/ek100_16frames_0.5fps.csv 
-  - data/ek55_16frames_0.5fps_train.csv
+  - data/ek100_16frames_0.5fps_train_extended.csv 
+  - data/ek55_16frames_0.5fps_train_extended.csv
   datasets_weights:
   - 0.5
   - 0.5
-  batch_size: 128
+  batch_size: 64
   crop_size: 256
   patch_size: 16
   dataset_fpcs:
@@ -88,7 +88,7 @@ optimization:
   epochs: 10
   final_lr: 0.001
   final_weight_decay: 0.04
-  ipe: 73
+  ipe: 1136
   ipe_scale: 1.25
   lr: 0.001
   start_lr: 0.0001

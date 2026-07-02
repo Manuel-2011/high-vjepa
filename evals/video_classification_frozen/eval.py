@@ -189,6 +189,7 @@ def main(args_eval, resume_preempt=False):
         patch_size=args_model['encoder']['patch_size'],
         allow_variable_length=allow_variable_length,
         tubelet_size=args_model['encoder']['tubelet_size'],
+        num_classes=num_classes,
     )
     val_loader, _ = make_dataloader(
         dataset_type=dataset_type,
@@ -209,6 +210,7 @@ def main(args_eval, resume_preempt=False):
         patch_size=args_model['encoder']['patch_size'],
         allow_variable_length=allow_variable_length,
         tubelet_size=args_model['encoder']['tubelet_size'],
+        num_classes=num_classes,
     )
     ipe = len(train_loader)
     logger.info(f"Dataloader created... iterations per epoch: {ipe}")
@@ -273,19 +275,20 @@ def main(args_eval, resume_preempt=False):
                 num_classes=num_classes,
             )
 
-        val_acc = run_one_epoch(
-            device=device,
-            training=False,
-            encoder=encoder,
-            classifiers=classifiers,
-            scaler=scaler,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            wd_scheduler=wd_scheduler,
-            data_loader=val_loader,
-            use_bfloat16=use_bfloat16,
-            num_classes=num_classes,
-        )
+        if epoch == num_epochs - 1:
+            val_acc = run_one_epoch(
+                device=device,
+                training=False,
+                encoder=encoder,
+                classifiers=classifiers,
+                scaler=scaler,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                wd_scheduler=wd_scheduler,
+                data_loader=val_loader,
+                use_bfloat16=use_bfloat16,
+                num_classes=num_classes,
+            )
 
         if isinstance(num_classes, list):
             logger.info(("[%5d] train:" % (epoch+1)) + (" %.3f%%"*len(num_classes) % tuple(train_acc)) + " test:" + " %.3f%%"*len(num_classes) % tuple(val_acc))
@@ -485,9 +488,10 @@ DEFAULT_NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
 # Create a collator that mask missing patches for the attention mechanism
 class AttnMaskCollator:
-    def __init__(self, patch_size: int, tubelet_size:int):
+    def __init__(self, patch_size: int, tubelet_size:int, num_classes:int|list):
         self.patch_size = patch_size
         self.tubelet_size = tubelet_size
+        self.num_classes = num_classes
     
     def __call__(self, batch): # 
         # batch: [(buffer, label, clip_indices)]
@@ -530,8 +534,11 @@ class AttnMaskCollator:
             frame_mask[i, :, :patches_num, :patches_num] = True
 
         # clip_indices = torch.utils.data.default_collate([sample[2] for sample in batch])
-        labels = torch.utils.data.default_collate([list(map(int, sample[1].split(','))) for sample in batch]) # Multi-labels should be separated by a comma
-        labels = torch.stack(labels, dim=0)
+        if isinstance(self.num_classes, list):
+            labels = torch.utils.data.default_collate([list(map(int, sample[1].split(','))) for sample in batch]) # Multi-labels should be separated by a comma
+            labels = torch.stack(labels, dim=0)
+        else:
+            labels = torch.utils.data.default_collate([sample[1] for sample in batch])
 
         return [[videos]], labels, None, [[frame_mask]]
 
@@ -557,6 +564,7 @@ def make_dataloader(
     allow_variable_length=False,
     tubelet_size=None,
     shuffle=True,
+    num_classes=None,
 ):
     if normalization is None:
         normalization = DEFAULT_NORMALIZATION
@@ -576,7 +584,7 @@ def make_dataloader(
     )
 
     if num_views_per_segment == 1 and num_segments==1:
-        collator = AttnMaskCollator(patch_size, tubelet_size)
+        collator = AttnMaskCollator(patch_size, tubelet_size, num_classes)
     else:
         collator = None
 
