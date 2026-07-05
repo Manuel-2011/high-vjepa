@@ -105,6 +105,7 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     persistent_workers = cfgs_data.get("persistent_workers", True)
+    allow_variable_length = cfgs_data.get("allow_variable_length", False)
 
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
@@ -139,7 +140,7 @@ def main(args, resume_preempt=False):
     eps = cfgs_opt.get("eps", 1.0e-8)
 
     # -- USE PRE-TRAINED MODEL
-    cfgs_use_pretrained_model = cfgs_meta.get("use_pretrained_model")
+    cfgs_use_pretrained_model = cfgs_meta.get("use_pretrained_model", {})
     use_pretrained_model = cfgs_use_pretrained_model.get("enabled", False)
     previous_fps = cfgs_use_pretrained_model.get("previous_fps", None)
     # ----------------------------------------------------------------------- #
@@ -246,6 +247,9 @@ def main(args, resume_preempt=False):
             previous_fps=previous_fps,
             current_fps=fps,
             previous_tubulet_size=tubelet_size,
+            tubelet_size=tubelet_size,
+            patch_size=patch_size,
+            allow_variable_length=allow_variable_length
         )
     else:
         collator = MaskCollator(
@@ -285,6 +289,7 @@ def main(args, resume_preempt=False):
         num_workers=num_workers,
         pin_mem=pin_mem,
         log_dir=None,
+        allow_variable_length=allow_variable_length
     )
     try:
         _dlen = len(unsupervised_loader)
@@ -426,6 +431,8 @@ def main(args, resume_preempt=False):
 
             for _fpc_sample in sample:
                 bs, fpc = _fpc_sample[0][-1][0].size()
+                if allow_variable_length:
+                    fpc = dataset_fpcs[0]
                 mask_meters[fpc].update(bs / batch_size)
 
             def load_clips():
@@ -438,7 +445,7 @@ def main(args, resume_preempt=False):
                 return all_clips, all_masks_enc, all_masks_pred
 
             clips, masks_enc, masks_pred = load_clips()
-            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0        
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
                 logger.info("Running garbage collection...")
@@ -465,16 +472,20 @@ def main(args, resume_preempt=False):
                         z = predictor(z, masks_enc, masks_pred)
                     return z
 
-                def loss_fn(z, h):
+                def loss_fn(z, h, masks_pred):
                     if is_causal:
                         h = [hi[:,1*encoder.module.backbone.patches_per_frame:] for hi in h] # Remove the first patch of each video
+                        masks_pred = masks_pred[0]
                     else:
                         # Assumption: predictor will have returned only masked tokens for z
                         h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_pred)]
 
                     loss, n = 0, 0
-                    for zi, hi in zip(z, h):
-                        if is_causal:
+                    for zi, hi, mask in zip(z, h, masks_pred):
+                        if is_causal and allow_variable_length:
+                            loss += ((torch.abs(zi - hi) ** loss_exp).mean(dim=2) * mask).sum() / mask.sum() / loss_exp
+                            n += 1
+                        elif is_causal:
                             loss += torch.mean(torch.abs(zi - hi) ** loss_exp) / loss_exp
                             n += 1
                         else:
@@ -488,7 +499,7 @@ def main(args, resume_preempt=False):
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z = forward_context(clips)
-                    loss = loss_fn(z, h)  # jepa prediction loss
+                    loss = loss_fn(z, h, masks_pred)  # jepa prediction loss
 
                 # Step 2. Backward & step
                 if mixed_precision:

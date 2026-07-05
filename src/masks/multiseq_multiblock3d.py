@@ -6,6 +6,7 @@
 import math
 from logging import getLogger
 from multiprocessing import Value
+from functools import reduce
 
 import torch
 
@@ -21,6 +22,9 @@ class SimpleCollator(object):
         previous_fps=None,
         current_fps=None,
         previous_tubulet_size=None,
+        tubelet_size=None,
+        patch_size=None,
+        allow_variable_length=False
     ):
         super(SimpleCollator, self).__init__()
 
@@ -30,6 +34,9 @@ class SimpleCollator(object):
         self.current_fps = current_fps
         self.frames_to_skip = int(previous_fps // current_fps)
         self.previous_tubulet_size = previous_tubulet_size
+        self.tubelet_size = tubelet_size
+        self.patch_size = patch_size
+        self.allow_variable_length = allow_variable_length
 
     def __call__(self, batch):
 
@@ -38,18 +45,22 @@ class SimpleCollator(object):
         filtered_batches = {fpc: [] for fpc in self.fpcs}
         for sample in batch:
             # Check if sample is from video dataset (has clip_indices) or image dataset
-            if len(sample) >= 3 and isinstance(sample[-1], (list, tuple)):
-                # Video sample: sample[-1] is clip_indices, sample[-1][-1] contains frame indices
-                try:
-                    fpc = len(sample[-1][-1])
-                    if self.use_pretrained_model:
-                        fpc = int((fpc // self.frames_to_skip)*self.previous_tubulet_size)
-                except (TypeError, IndexError):
-                    # Fallback: assume single frame if structure is unexpected
-                    fpc = 1
+            if self.allow_variable_length:
+                have_datasets_use_same_fpcs, fpc = reduce(lambda acc,val: (acc[0] and acc[1] == val,val), self.fpcs, (True, self.fpcs[0]))
+                assert have_datasets_use_same_fpcs, "When using clips of variable length, all datasets should have the same fpc"
             else:
-                # Image sample: single frame
-                fpc = 1
+                if len(sample) >= 3 and isinstance(sample[-1], (list, tuple)):
+                    # Video sample: sample[-1] is clip_indices, sample[-1][-1] contains frame indices
+                    try:
+                        fpc = len(sample[-1][-1])
+                        if self.use_pretrained_model:
+                            fpc = int((fpc // self.frames_to_skip)*self.previous_tubulet_size)
+                    except (TypeError, IndexError):
+                        # Fallback: assume single frame if structure is unexpected
+                        fpc = 1
+                else:
+                    # Image sample: single frame
+                    fpc = 1
             if fpc in filtered_batches:
                 filtered_batches[fpc] += [sample]
 
@@ -59,12 +70,57 @@ class SimpleCollator(object):
             batch_size = len(fpc_batch)
             if batch_size == 0:
                 continue
-            collated_batch = torch.utils.data.default_collate(fpc_batch)
+            
+            if self.allow_variable_length:
+                # Assume H, W, C are consistent
+                max_t = max(clip.shape[1] for sample in fpc_batch for clip in sample[0])
+                C, _, H, W = fpc_batch[0][0][0].shape
+
+                # Create padded tensor
+                videos = torch.zeros(
+                    batch_size,
+                    C,
+                    max_t,
+                    H,
+                    W,
+                    dtype=fpc_batch[0][0][0].dtype
+                )
+                ids = torch.full(
+                    (batch_size, max_t),
+                    -100,
+                    dtype=torch.int
+                )
+                labels = []
+
+                # Create mask
+                H_patches = H//self.patch_size
+                W_patches = W//self.patch_size
+                max_t_patches = max_t//self.tubelet_size
+                frame_mask = torch.zeros(
+                    batch_size,
+                    max_t_patches*H_patches*W_patches,
+                    dtype=torch.bool
+                )
+
+                for i, x in enumerate(fpc_batch):
+                    t = x[0][0].shape[1]
+                    ids[i, :t] = torch.tensor(x[2][0], dtype=torch.int)
+                    labels.append(x[1])
+
+                    videos[i, :, :t] = x[0][0]
+                    t_patches = t//self.tubelet_size
+                    patches_num = t_patches*H_patches*W_patches
+                    frame_mask[i, :patches_num] = True
+                collated_masks_enc = [frame_mask[:, :-H_patches*W_patches]]
+                collated_masks_pred = [frame_mask[:, H_patches*W_patches:]]
+            else:
+                collated_masks_enc, collated_masks_pred = [], []
+                collated_batch = torch.utils.data.default_collate(fpc_batch)
+                videos, labels, ids = collated_batch
 
             # ignore intermediate frames that are not needed
             # and keep consecutive frames to complete the tubulet
             if self.use_pretrained_model:
-                videos, labels, ids = collated_batch
                 for i in range(len(videos)):
                     B, C, T, H, W = videos[i].shape
                     videos[i] = (
@@ -76,8 +132,8 @@ class SimpleCollator(object):
                         ids[i].view(B, T//self.frames_to_skip, self.frames_to_skip)[:, :, :self.previous_tubulet_size]
                         .reshape(B, T//self.frames_to_skip * self.previous_tubulet_size)
                     )
-                collated_batch = [videos, labels, ids]
-            collated_masks_pred, collated_masks_enc = [], []
+            collated_batch = [[videos], labels, [ids]]
+            
             fpc_collations += [
                 (collated_batch, collated_masks_enc, collated_masks_pred)
             ]
