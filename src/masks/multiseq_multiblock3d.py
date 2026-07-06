@@ -113,6 +113,8 @@ class SimpleCollator(object):
                     frame_mask[i, :patches_num] = True
                 collated_masks_enc = [frame_mask[:, :-H_patches*W_patches]]
                 collated_masks_pred = [frame_mask[:, H_patches*W_patches:]]
+                videos = [videos]
+                ids = [ids]
             else:
                 collated_masks_enc, collated_masks_pred = [], []
                 collated_batch = torch.utils.data.default_collate(fpc_batch)
@@ -132,7 +134,7 @@ class SimpleCollator(object):
                         ids[i].view(B, T//self.frames_to_skip, self.frames_to_skip)[:, :, :self.previous_tubulet_size]
                         .reshape(B, T//self.frames_to_skip * self.previous_tubulet_size)
                     )
-            collated_batch = [[videos], labels, [ids]]
+            collated_batch = [videos, labels, ids]
             
             fpc_collations += [
                 (collated_batch, collated_masks_enc, collated_masks_pred)

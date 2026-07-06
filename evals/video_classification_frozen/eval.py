@@ -275,6 +275,7 @@ def main(args_eval, resume_preempt=False):
                 num_classes=num_classes,
             )
 
+        val_acc = None
         if epoch == num_epochs - 1:
             val_acc = run_one_epoch(
                 device=device,
@@ -291,14 +292,24 @@ def main(args_eval, resume_preempt=False):
             )
 
         if isinstance(num_classes, list):
-            logger.info(("[%5d] train:" % (epoch+1)) + (" %.3f%%"*len(num_classes) % tuple(train_acc)) + " test:" + " %.3f%%"*len(num_classes) % tuple(val_acc))
-            if rank == 0:
-                csv_logger.log(epoch + 1, *train_acc, *val_acc)
+            if not val_acc:
+                logger.info(("[%5d] train:" % (epoch+1)) + (" %.3f%%"*len(num_classes) % tuple(train_acc)))
+                if rank == 0:
+                    csv_logger.log(epoch + 1, *train_acc)
+            else:
+                logger.info(("[%5d] train:" % (epoch+1)) + (" %.3f%%"*len(num_classes) % tuple(train_acc)) + " test:" + " %.3f%%"*len(num_classes) % tuple(val_acc))
+                if rank == 0:
+                    csv_logger.log(epoch + 1, *train_acc, *val_acc)
 
         else:
-            logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
-            if rank == 0:
-                csv_logger.log(epoch + 1, train_acc, val_acc)
+            if not val_acc:
+                logger.info("[%5d] train: %.3f%%" % (epoch + 1, train_acc))
+                if rank == 0:
+                    csv_logger.log(epoch + 1, train_acc)
+            else:
+                logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
+                if rank == 0:
+                    csv_logger.log(epoch + 1, train_acc, val_acc)
 
         if val_only:
             return
