@@ -445,7 +445,7 @@ def main(args, resume_preempt=False):
                 return all_clips, all_masks_enc, all_masks_pred
 
             clips, masks_enc, masks_pred = load_clips()
-            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0        
+            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
                 logger.info("Running garbage collection...")
@@ -480,9 +480,10 @@ def main(args, resume_preempt=False):
                         # Assumption: predictor will have returned only masked tokens for z
                         h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_pred)]
 
-                    loss, n = 0, 0
-                    for zi, hi, mask in zip(z, h, masks_pred):
+                    loss, n, i = 0, 0, 0
+                    for zi, hi in zip(z, h):
                         if is_causal and allow_variable_length:
+                            mask = masks_pred[i]
                             loss += ((torch.abs(zi - hi) ** loss_exp).mean(dim=2) * mask).sum() / mask.sum() / loss_exp
                             n += 1
                         elif is_causal:
@@ -492,6 +493,7 @@ def main(args, resume_preempt=False):
                             for zij, hij in zip(zi, hi):
                                 loss += torch.mean(torch.abs(zij - hij) ** loss_exp) / loss_exp
                                 n += 1
+                        i += 1
                     loss /= n
                     return loss
 
