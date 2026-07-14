@@ -15,7 +15,6 @@ For each model configuration:
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import html
 import logging
@@ -618,11 +617,6 @@ def save_umap_plot(samples: List[PatchSample], output_path: Path, title: str) ->
     plt.close(fig)
 
 
-def image_to_base64(image_path: Path) -> str:
-    with open(image_path, "rb") as handle:
-        return base64.b64encode(handle.read()).decode("ascii")
-
-
 def summarize_clusters(samples: List[PatchSample]) -> Dict[int, int]:
     counts = Counter(sample.cluster for sample in samples)
     return dict(sorted(counts.items(), key=lambda item: item[0]))
@@ -658,8 +652,14 @@ def generate_html_report(model_reports: List[dict], output_path: Path, dataset_c
         ".model-meta { display: flex; flex-wrap: wrap; gap: 16px; color: #374151; margin-bottom: 14px; }",
         ".model-meta span { background: #eef2ff; padding: 6px 10px; border-radius: 999px; }",
         ".scatter-shell { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; align-items: start; }",
-        ".scatter-plot { width: 100%; min-height: 460px; border-radius: 14px; border: 1px solid #e5e7eb; background: linear-gradient(180deg, #ffffff 0%, #fafafa 100%); overflow: hidden; }",
-        ".scatter-plot svg { width: 100%; height: auto; display: block; }",
+        ".plot-column { min-width: 0; }",
+        ".plot-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }",
+        ".plot-toolbar button { background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe; border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; }",
+        ".plot-toolbar button:hover { background: #e0e7ff; }",
+        ".plot-toolbar .hint { color: #6b7280; font-size: 12px; margin-left: auto; }",
+        ".scatter-plot { position: relative; width: 100%; height: 560px; border-radius: 14px; border: 1px solid #e5e7eb; background: #ffffff; overflow: hidden; }",
+        ".scatter-plot canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }",
+        ".scatter-plot canvas.dragging { cursor: grabbing; }",
         ".hover-panel { position: sticky; top: 18px; background: #ffffff; border-radius: 16px; border: 1px solid #dbe2ea; box-shadow: 0 10px 24px rgba(15,23,42,0.08); padding: 14px; display: flex; flex-direction: column; gap: 12px; }",
         ".hover-panel h3 { margin: 0; font-size: 16px; }",
         ".hover-preview { width: 100%; aspect-ratio: 1 / 1; border-radius: 12px; background: #f8fafc; border: 1px dashed #cbd5e1; display: grid; place-items: center; overflow: hidden; }",
@@ -673,11 +673,6 @@ def generate_html_report(model_reports: List[dict], output_path: Path, dataset_c
         ".noise { color: #6b7280; }",
         ".cluster { white-space: nowrap; }",
         ".small { font-size: 13px; color: #6b7280; }",
-        ".plot-svg text { font-family: Arial, Helvetica, sans-serif; fill: #475569; }",
-        ".plot-svg .axis { stroke: #94a3b8; stroke-width: 1; }",
-        ".plot-svg .grid { stroke: #e2e8f0; stroke-width: 1; }",
-        ".plot-svg .point { cursor: pointer; transition: opacity 120ms ease; }",
-        ".plot-svg .point:hover { opacity: 1; }",
         "@media (max-width: 1000px) { .scatter-shell { grid-template-columns: 1fr; } .hover-panel { position: static; } }",
         "</style>",
         "</head>",
@@ -696,58 +691,12 @@ def generate_html_report(model_reports: List[dict], output_path: Path, dataset_c
         "  const palette = ['#2563eb', '#16a34a', '#dc2626', '#d97706', '#7c3aed', '#0f766e', '#db2777', '#4f46e5', '#0891b2', '#65a30d', '#ea580c', '#9333ea', '#0284c7', '#be123c', '#059669', '#ca8a04', '#1d4ed8', '#a855f7', '#0d9488', '#fb7185'];",
         "  return palette[clusterId % palette.length];",
         "}",
-        "function buildSvg(model) {",
-        "  const margin = { top: 36, right: 28, bottom: 42, left: 46 };",
-        "  const plotWidth = 1000;",
-        "  const plotHeight = 700;",
-        "  const innerWidth = plotWidth - margin.left - margin.right;",
-        "  const innerHeight = plotHeight - margin.top - margin.bottom;",
-        "  const xs = model.samples.map((sample) => sample.umap_x);",
-        "  const ys = model.samples.map((sample) => sample.umap_y);",
-        "  const xMin = Math.min.apply(null, xs);",
-        "  const xMax = Math.max.apply(null, xs);",
-        "  const yMin = Math.min.apply(null, ys);",
-        "  const yMax = Math.max.apply(null, ys);",
-        "  const xPad = Math.max(1e-3, 0.08 * ((xMax - xMin) || 1));",
-        "  const yPad = Math.max(1e-3, 0.08 * ((yMax - yMin) || 1));",
-        "  const xLo = xMin - xPad;",
-        "  const xHi = xMax + xPad;",
-        "  const yLo = yMin - yPad;",
-        "  const yHi = yMax + yPad;",
-        "  const xScale = function(value) { return margin.left + ((value - xLo) / (xHi - xLo)) * innerWidth; };",
-        "  const yScale = function(value) { return margin.top + (1 - ((value - yLo) / (yHi - yLo))) * innerHeight; };",
-        "  const tickCount = 5;",
-        "  const ticks = Array.from({ length: tickCount }, function(_, index) { return index / (tickCount - 1); });",
-        "  const lines = [];",
-        "  ticks.forEach(function(tick) {",
-        "    const x = margin.left + tick * innerWidth;",
-        "    const y = margin.top + tick * innerHeight;",
-        "    lines.push('<line class=\"grid\" x1=\"' + x + '\" y1=\"' + margin.top + '\" x2=\"' + x + '\" y2=\"' + (margin.top + innerHeight) + '\" />');",
-        "    lines.push('<line class=\"grid\" x1=\"' + margin.left + '\" y1=\"' + y + '\" x2=\"' + (margin.left + innerWidth) + '\" y2=\"' + y + '\" />');",
-        "  });",
-        "  const points = model.samples.map(function(sample, index) {",
-        "    const x = xScale(sample.umap_x);",
-        "    const y = yScale(sample.umap_y);",
-        "    const label = sample.cluster_label || (sample.cluster < 0 ? 'noise' : 'cluster ' + sample.cluster);",
-        "    return '<circle class=\"point\" tabindex=\"0\" cx=\"' + x + '\" cy=\"' + y + '\" r=\"6\" fill=\"' + clusterColor(sample.cluster) + '\" stroke=\"#ffffff\" stroke-width=\"2\" data-index=\"' + index + '\" data-cluster=\"' + escapeHtml(label) + '\" />';",
-        "  }).join('');",
-        "  return '<svg class=\"plot-svg\" viewBox=\"0 0 ' + plotWidth + ' ' + plotHeight + '\" preserveAspectRatio=\"none\" aria-label=\"' + escapeHtml(model.model_name) + '\">' +",
-        "    '<rect x=\"0\" y=\"0\" width=\"' + plotWidth + '\" height=\"' + plotHeight + '\" fill=\"#ffffff\" />' +",
-        "    lines.join('') +",
-        "    '<line class=\"axis\" x1=\"' + margin.left + '\" y1=\"' + (margin.top + innerHeight) + '\" x2=\"' + (margin.left + innerWidth) + '\" y2=\"' + (margin.top + innerHeight) + '\" />' +",
-        "    '<line class=\"axis\" x1=\"' + margin.left + '\" y1=\"' + margin.top + '\" x2=\"' + margin.left + '\" y2=\"' + (margin.top + innerHeight) + '\" />' +",
-        "    '<text x=\"' + (plotWidth / 2) + '\" y=\"24\" text-anchor=\"middle\" font-size=\"20\" fill=\"#0f172a\">' + escapeHtml(model.model_name) + '</text>' +",
-        "    '<text x=\"' + (plotWidth / 2) + '\" y=\"' + (plotHeight - 6) + '\" text-anchor=\"middle\" font-size=\"15\">' + escapeHtml(model.x_label || 'UMAP 1') + '</text>' +",
-        "    '<text x=\"16\" y=\"' + (plotHeight / 2) + '\" text-anchor=\"middle\" font-size=\"15\" transform=\"rotate(-90 16 ' + (plotHeight / 2) + ')\">' + escapeHtml(model.y_label || 'UMAP 2') + '</text>' +",
-        "    points +",
-        "  '</svg>';",
-        "}",
         "function setPreview(panel, sample) {",
         "  const img = panel.querySelector('.hover-preview-img');",
         "  const placeholder = panel.querySelector('.hover-preview-placeholder');",
         "  const title = panel.querySelector('.hover-preview-title');",
         "  const meta = panel.querySelector('.hover-meta');",
-        "  img.src = 'data:image/png;base64,' + sample.patch_b64;",
+        "  img.src = sample.patch_rel_path;",
         "  img.alt = 'Patch preview for ' + sample.video_path;",
         "  img.hidden = false;",
         "  placeholder.hidden = true;",
@@ -767,23 +716,197 @@ def generate_html_report(model_reports: List[dict], output_path: Path, dataset_c
         "  title.textContent = 'Hover a point';",
         "  meta.innerHTML = '<div>Move the pointer over a point in the scatter plot to inspect the crop.</div>';",
         "}",
-        "function wireUpModelCard(card, model) {",
-        "  const plot = card.querySelector('.scatter-plot');",
-        "  const panel = card.querySelector('.hover-panel');",
-        "  plot.innerHTML = buildSvg(model);",
-        "  const svg = plot.querySelector('svg');",
-        "  svg.querySelectorAll('.point').forEach(function(point) {",
-        "    const index = Number(point.getAttribute('data-index'));",
-        "    const sample = model.samples[index];",
-        "    point.addEventListener('mouseenter', function() { setPreview(panel, sample); });",
-        "    point.addEventListener('focus', function() { setPreview(panel, sample); });",
+        "function createScatterPlot(container, model, panel) {",
+        "  const samples = model.samples;",
+        "  const canvas = document.createElement('canvas');",
+        "  container.innerHTML = '';",
+        "  container.appendChild(canvas);",
+        "  const ctx = canvas.getContext('2d');",
+        "  const margin = { top: 30, right: 20, bottom: 40, left: 48 };",
+        "  const xs = samples.map(function(s) { return s.umap_x; });",
+        "  const ys = samples.map(function(s) { return s.umap_y; });",
+        "  const xMin = Math.min.apply(null, xs);",
+        "  const xMax = Math.max.apply(null, xs);",
+        "  const yMin = Math.min.apply(null, ys);",
+        "  const yMax = Math.max.apply(null, ys);",
+        "  const xPad = Math.max(1e-3, 0.08 * ((xMax - xMin) || 1));",
+        "  const yPad = Math.max(1e-3, 0.08 * ((yMax - yMin) || 1));",
+        "  const dataXLo = xMin - xPad, dataXHi = xMax + xPad;",
+        "  const dataYLo = yMin - yPad, dataYHi = yMax + yPad;",
+        "  const view = { scale: 1, tx: 0, ty: 0 };",
+        "  let hoverIndex = -1;",
+        "  let cssWidth = 0, cssHeight = 0;",
+        "  const dpr = window.devicePixelRatio || 1;",
+        "  function plotWidth() { return cssWidth - margin.left - margin.right; }",
+        "  function plotHeight() { return cssHeight - margin.top - margin.bottom; }",
+        "  function baseX(x) { return margin.left + ((x - dataXLo) / (dataXHi - dataXLo)) * plotWidth(); }",
+        "  function baseY(y) { return margin.top + (1 - (y - dataYLo) / (dataYHi - dataYLo)) * plotHeight(); }",
+        "  function toScreen(x, y) {",
+        "    const bx = baseX(x), by = baseY(y);",
+        "    return [bx * view.scale + view.tx, by * view.scale + view.ty];",
+        "  }",
+        "  let pending = false;",
+        "  function draw() {",
+        "    pending = false;",
+        "    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);",
+        "    ctx.clearRect(0, 0, cssWidth, cssHeight);",
+        "    ctx.fillStyle = '#ffffff';",
+        "    ctx.fillRect(0, 0, cssWidth, cssHeight);",
+        "    ctx.save();",
+        "    ctx.beginPath();",
+        "    ctx.rect(margin.left, margin.top, plotWidth(), plotHeight());",
+        "    ctx.clip();",
+        "    ctx.strokeStyle = '#e2e8f0';",
+        "    ctx.lineWidth = 1;",
+        "    const ticks = 5;",
+        "    for (let i = 0; i < ticks; i++) {",
+        "      const t = i / (ticks - 1);",
+        "      const gx = margin.left + t * plotWidth();",
+        "      const gy = margin.top + t * plotHeight();",
+        "      ctx.beginPath();",
+        "      ctx.moveTo(gx, margin.top);",
+        "      ctx.lineTo(gx, margin.top + plotHeight());",
+        "      ctx.stroke();",
+        "      ctx.beginPath();",
+        "      ctx.moveTo(margin.left, gy);",
+        "      ctx.lineTo(margin.left + plotWidth(), gy);",
+        "      ctx.stroke();",
+        "    }",
+        "    const radius = Math.max(1.6, Math.min(5, 5 * Math.sqrt(1 / Math.max(1, view.scale))));",
+        "    for (let idx = 0; idx < samples.length; idx++) {",
+        "      const sample = samples[idx];",
+        "      const pos = toScreen(sample.umap_x, sample.umap_y);",
+        "      const sx = pos[0], sy = pos[1];",
+        "      if (sx < margin.left - radius || sx > margin.left + plotWidth() + radius ||",
+        "          sy < margin.top - radius || sy > margin.top + plotHeight() + radius) {",
+        "        continue;",
+        "      }",
+        "      const isHover = idx === hoverIndex;",
+        "      ctx.beginPath();",
+        "      ctx.arc(sx, sy, isHover ? radius + 2.5 : radius, 0, Math.PI * 2);",
+        "      ctx.fillStyle = clusterColor(sample.cluster);",
+        "      ctx.globalAlpha = isHover ? 1 : 0.85;",
+        "      ctx.fill();",
+        "      ctx.lineWidth = isHover ? 2 : 1;",
+        "      ctx.strokeStyle = isHover ? '#0f172a' : '#ffffff';",
+        "      ctx.stroke();",
+        "      ctx.globalAlpha = 1;",
+        "    }",
+        "    ctx.restore();",
+        "    ctx.strokeStyle = '#94a3b8';",
+        "    ctx.lineWidth = 1;",
+        "    ctx.beginPath();",
+        "    ctx.moveTo(margin.left, margin.top + plotHeight());",
+        "    ctx.lineTo(margin.left + plotWidth(), margin.top + plotHeight());",
+        "    ctx.moveTo(margin.left, margin.top);",
+        "    ctx.lineTo(margin.left, margin.top + plotHeight());",
+        "    ctx.stroke();",
+        "    ctx.fillStyle = '#475569';",
+        "    ctx.font = '13px Arial, Helvetica, sans-serif';",
+        "    ctx.textAlign = 'center';",
+        "    ctx.fillText(model.x_label || 'UMAP 1', margin.left + plotWidth() / 2, cssHeight - 8);",
+        "    ctx.save();",
+        "    ctx.translate(14, margin.top + plotHeight() / 2);",
+        "    ctx.rotate(-Math.PI / 2);",
+        "    ctx.fillText(model.y_label || 'UMAP 2', 0, 0);",
+        "    ctx.restore();",
+        "  }",
+        "  function requestDraw() {",
+        "    if (!pending) {",
+        "      pending = true;",
+        "      requestAnimationFrame(draw);",
+        "    }",
+        "  }",
+        "  function clampScale(scale) { return Math.min(60, Math.max(0.5, scale)); }",
+        "  function zoomAt(px, py, factor) {",
+        "    const newScale = clampScale(view.scale * factor);",
+        "    const actualFactor = newScale / view.scale;",
+        "    view.tx = px - (px - view.tx) * actualFactor;",
+        "    view.ty = py - (py - view.ty) * actualFactor;",
+        "    view.scale = newScale;",
+        "    requestDraw();",
+        "  }",
+        "  function resetView() { view.scale = 1; view.tx = 0; view.ty = 0; requestDraw(); }",
+        "  function resize() {",
+        "    const rect = container.getBoundingClientRect();",
+        "    cssWidth = Math.max(1, rect.width);",
+        "    cssHeight = Math.max(1, rect.height);",
+        "    canvas.width = Math.round(cssWidth * dpr);",
+        "    canvas.height = Math.round(cssHeight * dpr);",
+        "    draw();",
+        "  }",
+        "  canvas.addEventListener('wheel', function(e) {",
+        "    e.preventDefault();",
+        "    const rect = canvas.getBoundingClientRect();",
+        "    const px = e.clientX - rect.left;",
+        "    const py = e.clientY - rect.top;",
+        "    const factor = Math.exp(-e.deltaY * 0.0015);",
+        "    zoomAt(px, py, factor);",
+        "  }, { passive: false });",
+        "  let dragging = false;",
+        "  let lastX = 0, lastY = 0;",
+        "  canvas.addEventListener('mousedown', function(e) {",
+        "    dragging = true;",
+        "    lastX = e.clientX;",
+        "    lastY = e.clientY;",
+        "    canvas.classList.add('dragging');",
         "  });",
-        "  svg.addEventListener('mouseleave', function() { resetPreview(panel); });",
+        "  window.addEventListener('mouseup', function() {",
+        "    dragging = false;",
+        "    canvas.classList.remove('dragging');",
+        "  });",
+        "  window.addEventListener('mousemove', function(e) {",
+        "    if (!dragging) return;",
+        "    view.tx += e.clientX - lastX;",
+        "    view.ty += e.clientY - lastY;",
+        "    lastX = e.clientX;",
+        "    lastY = e.clientY;",
+        "    requestDraw();",
+        "  });",
+        "  canvas.addEventListener('mousemove', function(e) {",
+        "    if (dragging) return;",
+        "    const rect = canvas.getBoundingClientRect();",
+        "    const mx = e.clientX - rect.left;",
+        "    const my = e.clientY - rect.top;",
+        "    let best = -1;",
+        "    let bestDist = 144;",
+        "    for (let i = 0; i < samples.length; i++) {",
+        "      const pos = toScreen(samples[i].umap_x, samples[i].umap_y);",
+        "      const dx = pos[0] - mx;",
+        "      const dy = pos[1] - my;",
+        "      const d = dx * dx + dy * dy;",
+        "      if (d < bestDist) { bestDist = d; best = i; }",
+        "    }",
+        "    if (best !== hoverIndex) { hoverIndex = best; requestDraw(); }",
+        "    if (best >= 0) { setPreview(panel, samples[best]); } else { resetPreview(panel); }",
+        "  });",
+        "  canvas.addEventListener('mouseleave', function() {",
+        "    if (!dragging) { hoverIndex = -1; resetPreview(panel); requestDraw(); }",
+        "  });",
+        "  const toolbar = container.parentElement.querySelector('.plot-toolbar');",
+        "  if (toolbar) {",
+        "    toolbar.querySelectorAll('button').forEach(function(button) {",
+        "      button.addEventListener('click', function() {",
+        "        const action = button.getAttribute('data-action');",
+        "        const cx = margin.left + plotWidth() / 2;",
+        "        const cy = margin.top + plotHeight() / 2;",
+        "        if (action === 'zoom-in') zoomAt(cx, cy, 1.4);",
+        "        else if (action === 'zoom-out') zoomAt(cx, cy, 1 / 1.4);",
+        "        else if (action === 'reset') resetView();",
+        "      });",
+        "    });",
+        "  }",
+        "  window.addEventListener('resize', resize);",
+        "  resize();",
         "  resetPreview(panel);",
         "}",
         "function initReport() {",
         "  const models = JSON.parse(document.getElementById('report-data').textContent);",
-        "  document.querySelectorAll('.model-card').forEach(function(card, index) { wireUpModelCard(card, models[index]); });",
+        "  document.querySelectorAll('.model-card').forEach(function(card, index) {",
+        "    const plot = card.querySelector('.scatter-plot');",
+        "    const panel = card.querySelector('.hover-panel');",
+        "    createScatterPlot(plot, models[index], panel);",
+        "  });",
         "}",
         "if (document.readyState === 'loading') {",
         "  document.addEventListener('DOMContentLoaded', initReport);",
@@ -813,7 +936,15 @@ def generate_html_report(model_reports: List[dict], output_path: Path, dataset_c
                 f"<span>Plot: {html.escape(Path(report['plot_path']).name)}</span>",
                 "</div>",
                 "<div class=\"scatter-shell\">",
+                "<div class=\"plot-column\">",
+                "<div class=\"plot-toolbar\">",
+                "<button type=\"button\" data-action=\"zoom-in\">Zoom in</button>",
+                "<button type=\"button\" data-action=\"zoom-out\">Zoom out</button>",
+                "<button type=\"button\" data-action=\"reset\">Reset view</button>",
+                "<span class=\"hint\">Scroll to zoom &middot; drag to pan &middot; hover a point to preview</span>",
+                "</div>",
                 "<div class=\"scatter-plot\"></div>",
+                "</div>",
                 "<aside class=\"hover-panel\">",
                 "<h3 class=\"hover-preview-title\">Hover a point</h3>",
                 "<div class=\"hover-preview\">",
@@ -864,6 +995,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional HDBSCAN min_samples value. If omitted, HDBSCAN uses its default behavior.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Number of clips to run through the encoder per forward pass.",
+    )
     return parser.parse_args()
 
 
@@ -902,10 +1039,10 @@ def main() -> None:
         tubelet_size = args_data["tubelet_size"]
         normalization = args_data.get("normalization", DEFAULT_NORMALIZATION)
 
-        data_loader, frame_skip_info = load_data_for_model(config, str(sampled_csv), batch_size=1)
+        data_loader, frame_skip_info = load_data_for_model(config, str(sampled_csv), batch_size=args.batch_size)
 
         samples: List[PatchSample] = []
-        for sample_idx, data in enumerate(tqdm(data_loader, total=len(data_loader), desc=f"{model_name}")):
+        for batch_idx, data in enumerate(tqdm(data_loader, total=len(data_loader), desc=f"{model_name}")):
             try:
                 clips = [[dij.to(device, non_blocking=True) for dij in di] for di in data[0]]
                 clip_indices = data[2]
@@ -931,12 +1068,16 @@ def main() -> None:
                 videos = clips[0][0]
                 batch_size = videos.shape[0]
                 token_validity = torch.diagonal(view_attn_mask[:, 0], dim1=-2, dim2=-1)
-                rng = np.random.default_rng(args.seed + sample_idx)
+                rng = np.random.default_rng(args.seed + batch_idx)
 
                 for batch_index in range(batch_size):
+                    # Order-preserving map back into sampled_manifest: shuffle=False and
+                    # drop_last=False mean every batch but the last is exactly
+                    # args.batch_size long, so this recovers the flat sample position.
+                    global_idx = batch_idx * args.batch_size + batch_index
                     valid_token_indices = torch.where(token_validity[batch_index])[0]
                     if len(valid_token_indices) == 0:
-                        logger.warning("No valid tokens found for sample %d in %s", sample_idx, model_name)
+                        logger.warning("No valid tokens found for sample %d in %s", global_idx, model_name)
                         continue
 
                     token_index = int(valid_token_indices[int(rng.integers(0, len(valid_token_indices)))].item())
@@ -960,13 +1101,13 @@ def main() -> None:
 
                     patch_dir = output_dir / model_slug / "patches"
                     patch_dir.mkdir(parents=True, exist_ok=True)
-                    patch_path = patch_dir / f"sample_{sample_idx:04d}.png"
+                    patch_path = patch_dir / f"sample_{global_idx:04d}.png"
                     patch_image.save(patch_path)
 
-                    source_row = sampled_manifest.iloc[sample_idx]
+                    source_row = sampled_manifest.iloc[global_idx]
                     samples.append(
                         PatchSample(
-                            sample_index=sample_idx,
+                            sample_index=global_idx,
                             video_path=str(source_row["video_path"]),
                             patch_path=str(patch_path),
                             embedding=embedding,
@@ -979,7 +1120,7 @@ def main() -> None:
                 if len(samples) >= args.num_samples:
                     break
             except Exception as exc:
-                logger.error("Failed processing sample %d for %s: %s", sample_idx, model_name, exc)
+                logger.error("Failed processing batch %d for %s: %s", batch_idx, model_name, exc)
 
         if not samples:
             logger.warning("No samples collected for %s", model_name)
@@ -1038,7 +1179,7 @@ def main() -> None:
                 "samples": [
                     {
                         "video_path": sample.video_path,
-                        "patch_b64": image_to_base64(Path(sample.patch_path)),
+                        "patch_rel_path": os.path.relpath(sample.patch_path, output_dir),
                         "token_index": sample.token_index,
                         "temporal_token_index": sample.temporal_token_index,
                         "spatial_token_index": sample.spatial_token_index,
