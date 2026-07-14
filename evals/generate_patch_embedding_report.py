@@ -46,8 +46,9 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from evals.video_classification_frozen.models import init_module
-from evals.video_classification_frozen.eval import make_dataloader
+from evals.video_classification_frozen.eval import AttnMaskCollator
 from evals.video_classification_frozen.utils import make_transforms
+from src.datasets.data_manager import init_data
 
 logger = logging.getLogger(__name__)
 
@@ -57,27 +58,27 @@ MODELS_CONFIG = [
     {
         "name": "V-JEPA2 (baseline)",
         "checkpoint": "preliminary_experiments/EK100-vjepa-16f-4pfs/latest.pt",
-        "config": "configs/eval/vitl/ek100-ar.yaml",
+        "config": "configs/train/vitl16-EK100/pretrain-vjepa.yaml",
     },
     # {
     #     "name": "High V-JEPA (Same data as baseline)",
     #     "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f_extended/latest.pt",
-    #     "config": "configs/eval/vitl/ek100-ar-high-vjepa_extended.yaml",
+    #     "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_extended.yaml",
     # },
     # {
     #     "name": "High V-JEPA (Same data + patches)",
     #     "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f-16x16/latest.pt",
-    #     "config": "configs/eval/vitl/ek100-ar-high-vjepa_extended_16x16.yaml",
+    #     "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_extended_16x16.yaml",
     # },
     # {
     #     "name": "V-JEPA2 - Causal learning",
     #     "checkpoint": "preliminary_experiments/EK100-vjepa-16f-4pfs-future-prediction/latest.pt",
-    #     "config": "configs/eval/vitl/ek100-ar-causal-backbone.yaml",
+    #     "config": "configs/train/vitl16-EK100/pretrain-vjepa-future-prediction-task.yaml",
     # },
     # {
     #     "name": "High V-JEPA on V-JEPA2",
     #     "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f-16x16_post_training/latest.pt",
-    #     "config": "configs/eval/vitl/ek100-ar-high-vjepa-post-trained.yaml",
+    #     "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_16x16_post_training.yaml",
     # },
 ]
 
@@ -134,7 +135,7 @@ def load_manifest(csv_path: str) -> pd.DataFrame:
 
 def sample_rows(df: pd.DataFrame, n_samples: int, seed: int) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    sample_size = min(len(df), max(n_samples * 3, n_samples))
+    sample_size = min(len(df), n_samples)
     indices = rng.choice(len(df), size=sample_size, replace=False)
     return df.iloc[indices].reset_index(drop=True)
 
@@ -247,23 +248,37 @@ def load_model_checkpoint(config: dict, encoder_emb_dim: int, device: str = "cud
 
 
 def prepare_encoder(config: dict, device: str):
-    args_exp = config.get("experiment")
-    args_data = args_exp.get("data")
-    args_model = config.get("model_kwargs")
+    args_data = config["data"]
+    args_model = config["model"]
 
-    resolution = args_data.get("resolution", 224)
-    frames_per_clip = args_data.get("frames_per_clip", 16)
+    resolution = args_data.get("crop_size", 224)
+    frames_per_clip = max(args_data["dataset_fpcs"])
+    patch_size = args_data["patch_size"]
+    tubelet_size = args_data["tubelet_size"]
+
+    checkpoint = os.path.join(config["folder"], "latest.pt")
+    model_kwargs = {
+        "encoder": {
+            "checkpoint_key": "target_encoder",
+            "img_temporal_dim_size": None,
+            "model_name": args_model["model_name"],
+            "patch_size": patch_size,
+            "tubelet_size": tubelet_size,
+            "uniform_power": args_model.get("uniform_power", False),
+            "use_rope": args_model.get("use_rope", False),
+        }
+    }
+    wrapper_kwargs = {"max_frames": frames_per_clip, "use_pos_embed": False}
 
     encoder = init_module(
-        args_model["module_name"],
+        "evals.video_classification_frozen.modelcustom.vit_encoder_multiclip",
         device,
         frames_per_clip,
         resolution,
-        args_model["checkpoint"],
-        args_model["pretrain_kwargs"],
-        args_model["wrapper_kwargs"],
+        checkpoint,
+        model_kwargs,
+        wrapper_kwargs,
     )
-    # classifiers = load_model_checkpoint(config, encoder.embed_dim, device=device)
     classifiers = None
 
     return encoder, classifiers
@@ -282,43 +297,97 @@ def build_transform(config: dict):
 
 
 def load_data_for_model(config: dict, data_path: str, batch_size: int = 1):
-    args_data = config["experiment"].get("data")
+    args_data = config["data"]
     dataset_type = args_data.get("dataset_type", "VideoDataset")
-    resolution = args_data.get("resolution", 224)
-    num_segments = 1
-    frames_per_clip = args_data.get("frames_per_clip", 16)
-    frame_step = args_data.get("frame_step", 4)
-    duration = args_data.get("clip_duration", None)
-    normalization = args_data.get("normalization", None)
+    resolution = args_data.get("crop_size", 224)
+    frames_per_clip = max(args_data["dataset_fpcs"])
+    fps = args_data.get("fps")
+    patch_size = args_data["patch_size"]
+    tubelet_size = args_data["tubelet_size"]
+    normalization = args_data.get("normalization", DEFAULT_NORMALIZATION)
     allow_variable_length = args_data.get("allow_variable_length", False)
-    args_model = config.get("model_kwargs").get("pretrain_kwargs")
+    num_workers = args_data.get("num_workers", 16)
+    persistent_workers = args_data.get("persistent_workers", False)
+    pin_mem = args_data.get("pin_mem", True)
 
-    if args_data.get("num_segments", 1) != 1:
-        logger.warning("Patch embedding report forces num_segments=1 so attn_mask is available.")
+    # A causal model continued from a pretrained checkpoint at a coarser fps
+    # (meta.use_pretrained_model) samples raw frames at `previous_fps` over a
+    # longer window, then keeps only the leading `previous_tubulet_size` frames
+    # of every `frames_to_skip`-sized chunk so the encoder still sees clips
+    # shaped like the ones its backbone was pretrained on. See SimpleCollator
+    # in src/masks/multiseq_multiblock3d.py, mirrored by
+    # apply_pretrained_frame_skip() below.
+    use_pretrained_cfg = config.get("meta", {}).get("use_pretrained_model") or {}
+    use_pretrained_model = use_pretrained_cfg.get("enabled", False)
+    frame_skip_info = None
+    if use_pretrained_model:
+        previous_fps = use_pretrained_cfg["previous_fps"]
+        previous_tubelet_size = use_pretrained_cfg.get("previous_tubulet_size", tubelet_size)
+        frames_to_skip = int(previous_fps // fps)
+        sampling_fps = previous_fps
+        sampling_frames_per_clip = int(frames_per_clip * frames_to_skip / tubelet_size)
+        frame_skip_info = (frames_to_skip, previous_tubelet_size)
+    else:
+        sampling_fps = fps
+        sampling_frames_per_clip = frames_per_clip
 
-    data_loader, _ = make_dataloader(
-        dataset_type=dataset_type,
+    # Mirrors evals.video_classification_frozen.eval.make_dataloader, but passes
+    # `fps` straight through to VideoDataset instead of a fixed `frame_step`, so
+    # the per-video frame stride is derived from each clip's native fps exactly
+    # like it is during pretraining (see src/datasets/video_dataset.py).
+    #
+    # Note: config["data"]["dataset_fpcs"]/"datasets_weights" describe the
+    # original multi-dataset training mix and aren't forwarded here — root_path
+    # is a single flattened sampled-manifest CSV, and VideoDataset requires
+    # dataset_fpcs/datasets_weights to have one entry per root_path dataset.
+    transform = make_transforms(
+        training=False,
+        num_views_per_clip=1,
+        random_horizontal_flip=False,
+        random_resize_aspect_ratio=(0.75, 4 / 3),
+        random_resize_scale=(0.08, 1.0),
+        reprob=0.25,
+        auto_augment=True,
+        motion_shift=False,
+        crop_size=resolution,
+        normalize=normalization,
+    )
+    collator = AttnMaskCollator(patch_size, tubelet_size, num_classes=None)
+
+    data_loader, _ = init_data(
+        data=dataset_type,
         root_path=data_path,
-        img_size=resolution,
-        frames_per_clip=frames_per_clip,
-        frame_step=frame_step,
-        num_segments=num_segments,
-        eval_duration=duration,
-        num_views_per_segment=1,
-        allow_segment_overlap=True,
+        transform=transform,
         batch_size=batch_size,
         world_size=1,
         rank=0,
+        clip_len=sampling_frames_per_clip,
+        fps=sampling_fps,
+        num_clips=1,
+        allow_clip_overlap=True,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_mem=pin_mem,
+        drop_last=False,
+        collator=collator,
         training=False,
-        num_workers=16,
-        normalization=normalization,
-        patch_size=args_model["encoder"]["patch_size"],
         allow_variable_length=allow_variable_length,
-        tubelet_size=args_model["encoder"]["tubelet_size"],
         shuffle=False,
     )
 
-    return data_loader
+    return data_loader, frame_skip_info
+
+
+def apply_pretrained_frame_skip(clip: torch.Tensor, frames_to_skip: int, previous_tubelet_size: int) -> torch.Tensor:
+    """Reduce a clip sampled at `previous_fps` down to the tubelet arrangement
+    a use_pretrained_model backbone actually expects, matching SimpleCollator's
+    per-chunk frame-skip in src/masks/multiseq_multiblock3d.py."""
+    batch_size, channels, num_frames, height, width = clip.shape
+    return (
+        clip.view(batch_size, channels, num_frames // frames_to_skip, frames_to_skip, height, width)[
+            :, :, :, :previous_tubelet_size, :, :
+        ].reshape(batch_size, channels, num_frames // frames_to_skip * previous_tubelet_size, height, width)
+    )
 
 
 def encode_patch_sample(
@@ -781,7 +850,7 @@ def parse_args() -> argparse.Namespace:
         default="preliminary_experiments/evals/vitl/vjepa_ek100_patch_embeddings",
         help="Directory where the report artifacts will be saved.",
     )
-    parser.add_argument("--num-samples", type=int, default=64, help="Number of random videos to sample per model.")
+    parser.add_argument("--num-samples", type=int, default=200, help="Number of random videos to sample per model.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed used for sampling and visualization.")
     parser.add_argument(
         "--hdbscan-min-cluster-size",
@@ -828,16 +897,12 @@ def main() -> None:
             logger.error("Failed to load %s: %s", model_name, exc)
             continue
 
-        args_exp = config.get("experiment")
-        args_data = args_exp.get("data")
-        args_model = config.get("model_kwargs")
-        frames_per_clip = args_data.get("frames_per_clip", 16)
-        frame_step = args_data.get("frame_step", 4)
-        patch_size = args_model["pretrain_kwargs"]["encoder"]["patch_size"]
-        tubelet_size = args_model["pretrain_kwargs"]["encoder"]["tubelet_size"]
+        args_data = config["data"]
+        patch_size = args_data["patch_size"]
+        tubelet_size = args_data["tubelet_size"]
         normalization = args_data.get("normalization", DEFAULT_NORMALIZATION)
 
-        data_loader = load_data_for_model(config, str(sampled_csv), batch_size=1)
+        data_loader, frame_skip_info = load_data_for_model(config, str(sampled_csv), batch_size=1)
 
         samples: List[PatchSample] = []
         for sample_idx, data in enumerate(tqdm(data_loader, total=len(data_loader), desc=f"{model_name}")):
@@ -847,6 +912,16 @@ def main() -> None:
                 if clip_indices is not None:
                     clip_indices = [d.to(device, non_blocking=True) for d in clip_indices]
                 attn_mask = [[dij.to(device, non_blocking=True) for dij in di] for di in data[3]]
+
+                if frame_skip_info is not None:
+                    frames_to_skip, previous_tubelet_size = frame_skip_info
+                    clips = [[apply_pretrained_frame_skip(view, frames_to_skip, previous_tubelet_size) for view in clip] for clip in clips]
+                    # AttnMaskCollator's mask was sized for the pre-skip clip length; every
+                    # sample in this fixed-length path is fully valid post-skip, so rebuild
+                    # a fully-valid mask at the new (smaller) token count instead of slicing it.
+                    b, _, t, h, w = clips[0][0].shape
+                    num_tokens = (t // tubelet_size) * (h // patch_size) * (w // patch_size)
+                    attn_mask = [[torch.ones(b, 1, num_tokens, num_tokens, dtype=torch.bool, device=device)]]
 
                 with torch.no_grad():
                     outputs, attn_mask = encoder(clips, clip_indices, attn_mask)
