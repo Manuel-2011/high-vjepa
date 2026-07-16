@@ -78,6 +78,7 @@ def init_data(
             transform=transform,
             datasets_weights=datasets_weights,
             collator=collator,
+            drop_last=drop_last,
             num_workers=num_workers,
             pin_mem=pin_mem,
             persistent_workers=persistent_workers,
