@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 # each should be a whitespace-separated file with a video path per row,
 # exactly like the manifests consumed by generate_patch_embedding_report.py.
 DATASETS_CONFIG = [
+    {"name": "Random videos", "csv": "data/minidataset_random.csv"},
     {"name": "Wash action", "csv": "data/minidataset_wash_action.csv"},
     {"name": "Plate object", "csv": "data/minidataset_plate_object.csv"},
     {"name": "Same person same day", "csv": "data/minidataset_same_person_same_day.csv"},
@@ -322,12 +323,95 @@ def save_distance_bar_chart(model_name: str, model_df: pd.DataFrame, output_path
     plt.close(fig)
 
 
+def save_model_comparison_chart(results_df: pd.DataFrame, output_path: Path) -> None:
+    """One figure, one subplot per metric, comparing every model's mean ± std
+    distance across all mini datasets side by side."""
+    if results_df.empty:
+        return
+
+    models = list(dict.fromkeys(results_df["model"]))
+    datasets = list(dict.fromkeys(results_df["dataset"]))
+    if not models or not datasets:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(max(10, 2.6 * len(datasets)), 10), dpi=150)
+    axes = axes.flatten()
+    x = np.arange(len(datasets))
+    width = 0.8 / len(models)
+
+    for ax, metric in zip(axes, METRICS):
+        metric_df = results_df[results_df["metric"] == metric]
+        for i, model in enumerate(models):
+            model_df = metric_df[metric_df["model"] == model].set_index("dataset")
+            means = [model_df.loc[name, "mean"] if name in model_df.index else np.nan for name in datasets]
+            stds = [model_df.loc[name, "std"] if name in model_df.index else 0.0 for name in datasets]
+            offset = (i - (len(models) - 1) / 2) * width
+            ax.bar(x + offset, means, width=width, yerr=stds, capsize=2, label=model)
+        ax.set_xticks(x)
+        ax.set_xticklabels(datasets, rotation=20, ha="right", fontsize=8)
+        ax.set_title(METRIC_LABELS[metric], fontsize=11)
+        ax.grid(axis="y", alpha=0.2)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(len(models), 4), bbox_to_anchor=(0.5, 1.04), fontsize=9)
+    fig.suptitle("Cross-model comparison: within-dataset patch embedding distance", y=1.08)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def append_model_comparison_section(
+    lines: List[str],
+    results_df: pd.DataFrame,
+    model_meta: Dict[str, dict],
+    output_dir: Path,
+    comparison_chart_path: Optional[Path],
+) -> None:
+    if results_df.empty:
+        return
+
+    models = [name for name in model_meta if name in set(results_df["model"])]
+    datasets = list(dict.fromkeys(results_df["dataset"]))
+    if not models or not datasets:
+        return
+
+    lines.append("## Model Comparison")
+    lines.append("")
+    lines.append("Direct comparison of every tested model across all mini datasets and metrics.")
+    lines.append("")
+
+    if comparison_chart_path is not None:
+        rel_chart = Path(comparison_chart_path).relative_to(output_dir)
+        lines.append(f"![Model comparison]({rel_chart.as_posix()})")
+        lines.append("")
+
+    for metric in METRICS:
+        metric_df = results_df[results_df["metric"] == metric]
+        lines.append(f"### {METRIC_LABELS[metric]}")
+        lines.append("")
+        lines.append("| Dataset | " + " | ".join(models) + " |")
+        lines.append("| --- | " + " | ".join(["---"] * len(models)) + " |")
+        for dataset_name in datasets:
+            row_cells = []
+            for model in models:
+                row = metric_df[(metric_df["dataset"] == dataset_name) & (metric_df["model"] == model)]
+                if row.empty:
+                    row_cells.append("n/a")
+                else:
+                    mean = row.iloc[0]["mean"]
+                    std = row.iloc[0]["std"]
+                    row_cells.append(f"{mean:.4f} ± {std:.4f}")
+            lines.append(f"| {dataset_name} | " + " | ".join(row_cells) + " |")
+        lines.append("")
+
+
 def generate_markdown_report(
     results_df: pd.DataFrame,
     model_meta: Dict[str, dict],
     dataset_infos: List[dict],
     output_dir: Path,
     report_path: Path,
+    comparison_chart_path: Optional[Path] = None,
 ) -> None:
     lines: List[str] = []
     lines.append("# Patch Embedding Distance Report")
@@ -418,6 +502,8 @@ def generate_markdown_report(
             )
 
         lines.append("")
+
+    append_model_comparison_section(lines, results_df, model_meta, output_dir, comparison_chart_path)
 
     lines.append("## Raw data")
     lines.append("")
@@ -542,8 +628,15 @@ def main() -> None:
         save_distance_bar_chart(model_name, model_df, chart_path)
         model_meta[model_name]["chart_path"] = str(chart_path)
 
+    comparison_chart_path = None
+    if not results_df.empty and len(model_meta) > 1:
+        comparison_chart_path = output_dir / "model_comparison.png"
+        save_model_comparison_chart(results_df, comparison_chart_path)
+
     report_path = output_dir / "patch_distance_report.md"
-    generate_markdown_report(results_df, model_meta, dataset_infos, output_dir, report_path)
+    generate_markdown_report(
+        results_df, model_meta, dataset_infos, output_dir, report_path, comparison_chart_path
+    )
     logger.info("Markdown report saved to %s", report_path)
 
 
