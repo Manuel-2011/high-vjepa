@@ -56,6 +56,7 @@ from evals.generate_patch_embedding_report import (
     load_data_for_model,
     load_manifest,
     prepare_encoder,
+    rebuild_attn_mask_after_frame_skip,
     sample_rows,
     slugify,
     MODELS_CONFIG,
@@ -176,37 +177,6 @@ def prepare_split_manifest(
     }
 
 
-def rebuild_attn_mask_after_frame_skip(
-    pre_skip_validity: torch.Tensor,
-    num_spatial_tokens: int,
-    tubelet_size: int,
-    frames_to_skip: int,
-    previous_tubelet_size: int,
-    num_tokens_post: int,
-) -> torch.Tensor:
-    """Resize AttnMaskCollator's mask to the post-frame-skip token count while
-    preserving each clip's real length.
-
-    The collator sized its mask for the pre-skip clip (sampled at
-    `previous_fps`), where clip i has `valid_i` real tokens as a contiguous
-    prefix. apply_pretrained_frame_skip() keeps the leading
-    `previous_tubelet_size` frames of every `frames_to_skip`-sized chunk, and
-    padding always sits at the tail, so a clip's real length shrinks by the same
-    factor and stays a prefix. The sibling report generators instead rebuild a
-    fully-valid mask, which is only correct for fixed-length clips - action
-    segments here have genuinely different lengths.
-    """
-    device = pre_skip_validity.device
-    valid_tokens_pre = pre_skip_validity.sum(dim=1)
-    frames_pre = (valid_tokens_pre // num_spatial_tokens) * tubelet_size
-    frames_post = (frames_pre // frames_to_skip) * previous_tubelet_size
-    valid_tokens_post = (frames_post // tubelet_size) * num_spatial_tokens
-
-    token_ids = torch.arange(num_tokens_post, device=device)
-    valid = token_ids.unsqueeze(0) < valid_tokens_post.unsqueeze(1)  # (B, N_post)
-    return (valid.unsqueeze(2) & valid.unsqueeze(1)).unsqueeze(1)  # (B, 1, N, N)
-
-
 def pool_clip_embeddings(view_output: torch.Tensor, token_validity: torch.Tensor) -> torch.Tensor:
     """(B, N, D) token embeddings -> (B, D) clip embeddings.
 
@@ -263,6 +233,12 @@ def extract_features(
                     for clip in clips
                 ]
                 _, _, t_post, height, width = clips[0][0].shape
+                if t_post < tubelet_size:
+                    # Every clip of this batch was shorter than one
+                    # frames_to_skip-sized chunk, so nothing survives the skip.
+                    num_skipped += int(clips[0][0].shape[0])
+                    num_seen += int(clips[0][0].shape[0])
+                    continue
                 num_spatial_tokens = (height // patch_size) * (width // patch_size)
                 num_tokens_post = (t_post // tubelet_size) * num_spatial_tokens
                 attn_mask = [

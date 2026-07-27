@@ -45,7 +45,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from evals.generate_patch_embedding_report import MODELS_CONFIG
+from evals.generate_patch_embedding_report import MODELS_CONFIG, rebuild_attn_mask_after_frame_skip
 from evals.video_classification_frozen.eval import AttnMaskCollator
 from evals.video_classification_frozen.utils import make_transforms
 from src.datasets.data_manager import init_data
@@ -271,12 +271,21 @@ def load_data_for_model(config: dict, data_path: str, batch_size: int = 1):
 def apply_pretrained_frame_skip(clip: torch.Tensor, frames_to_skip: int, previous_tubelet_size: int) -> torch.Tensor:
     """Reduce a clip sampled at `previous_fps` down to the tubelet arrangement
     a use_pretrained_model backbone actually expects, matching SimpleCollator's
-    per-chunk frame-skip in src/masks/multiseq_multiblock3d.py."""
+    per-chunk frame-skip in src/masks/multiseq_multiblock3d.py.
+
+    A trailing partial chunk is dropped. Pretraining never produces one -
+    SimpleCollator buckets samples by fpc, so every clip is a whole number of
+    `frames_to_skip`-sized chunks - but AttnMaskCollator pads a batch to its
+    longest action segment, which with allow_variable_length is an arbitrary
+    frame count. Truncating keeps the floor division that the callers' mask
+    rebuilds already assume; reshaping instead would just fail."""
     batch_size, channels, num_frames, height, width = clip.shape
+    num_chunks = num_frames // frames_to_skip
+    clip = clip[:, :, : num_chunks * frames_to_skip]
     return (
-        clip.view(batch_size, channels, num_frames // frames_to_skip, frames_to_skip, height, width)[
+        clip.reshape(batch_size, channels, num_chunks, frames_to_skip, height, width)[
             :, :, :, :previous_tubelet_size, :, :
-        ].reshape(batch_size, channels, num_frames // frames_to_skip * previous_tubelet_size, height, width)
+        ].reshape(batch_size, channels, num_chunks * previous_tubelet_size, height, width)
     )
 
 
@@ -846,13 +855,27 @@ def main() -> None:
 
                 if frame_skip_info is not None:
                     frames_to_skip, previous_tubelet_size = frame_skip_info
+                    pre_skip_validity = torch.diagonal(attn_mask[0][0][:, 0], dim1=-2, dim2=-1)
                     clips = [[apply_pretrained_frame_skip(view, frames_to_skip, previous_tubelet_size) for view in clip] for clip in clips]
-                    # AttnMaskCollator's mask was sized for the pre-skip clip length; every
-                    # sample in this fixed-length path is fully valid post-skip, so rebuild
-                    # a fully-valid mask at the new (smaller) token count instead of slicing it.
-                    b, _, t, h, w = clips[0][0].shape
-                    num_tokens = (t // tubelet_size) * (h // patch_size) * (w // patch_size)
-                    attn_mask = [[torch.ones(b, 1, num_tokens, num_tokens, dtype=torch.bool, device=device)]]
+                    # AttnMaskCollator's mask was sized for the pre-skip clip length, so
+                    # rebuild it at the new (smaller) token count. Under fixed-length clips
+                    # this is an all-True mask; it only differs when a config enables
+                    # allow_variable_length, where each clip keeps its own real length.
+                    _, _, t, h, w = clips[0][0].shape
+                    num_spatial_tokens = (h // patch_size) * (w // patch_size)
+                    num_tokens = (t // tubelet_size) * num_spatial_tokens
+                    attn_mask = [
+                        [
+                            rebuild_attn_mask_after_frame_skip(
+                                pre_skip_validity,
+                                num_spatial_tokens=num_spatial_tokens,
+                                tubelet_size=tubelet_size,
+                                frames_to_skip=frames_to_skip,
+                                previous_tubelet_size=previous_tubelet_size,
+                                num_tokens_post=num_tokens,
+                            )
+                        ]
+                    ]
 
                 with torch.no_grad():
                     outputs, attn_mask = encoder(clips, clip_indices, attn_mask)

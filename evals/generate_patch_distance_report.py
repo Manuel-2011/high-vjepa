@@ -48,6 +48,7 @@ from evals.generate_patch_embedding_report import (
     load_data_for_model,
     load_manifest,
     prepare_encoder,
+    rebuild_attn_mask_after_frame_skip,
     sample_rows,
     slugify,
     MODELS_CONFIG,
@@ -65,6 +66,7 @@ DATASETS_CONFIG = [
     {"name": "Wash action", "csv": "data/minidataset_wash_action.csv"},
     {"name": "Plate object", "csv": "data/minidataset_plate_object.csv"},
     {"name": "Same person same day", "csv": "data/minidataset_same_person_same_day.csv"},
+    {"name": "Consecutive clips", "csv": "data/minidataset_same_person_same_day_consecutive.csv"},
 ]
 
 # All metrics are expressed as *distances*: lower means more similar. Cosine,
@@ -155,15 +157,28 @@ def collect_grid_embeddings(
 
             if frame_skip_info is not None:
                 frames_to_skip, previous_tubelet_size = frame_skip_info
+                pre_skip_validity = torch.diagonal(attn_mask[0][0][:, 0], dim1=-2, dim2=-1)
                 clips = [
                     [apply_pretrained_frame_skip(view, frames_to_skip, previous_tubelet_size) for view in clip]
                     for clip in clips
                 ]
                 # See generate_patch_embedding_report.py: the mask was sized for the
-                # pre-skip clip length, so rebuild a fully-valid mask post-skip.
-                b, _, t, h, w = clips[0][0].shape
-                num_tokens = (t // tubelet_size) * (h // patch_size) * (w // patch_size)
-                attn_mask = [[torch.ones(b, 1, num_tokens, num_tokens, dtype=torch.bool, device=device)]]
+                # pre-skip clip length, so rebuild it at the post-skip token count.
+                _, _, t, h, w = clips[0][0].shape
+                num_spatial_tokens = (h // patch_size) * (w // patch_size)
+                num_tokens = (t // tubelet_size) * num_spatial_tokens
+                attn_mask = [
+                    [
+                        rebuild_attn_mask_after_frame_skip(
+                            pre_skip_validity,
+                            num_spatial_tokens=num_spatial_tokens,
+                            tubelet_size=tubelet_size,
+                            frames_to_skip=frames_to_skip,
+                            previous_tubelet_size=previous_tubelet_size,
+                            num_tokens_post=num_tokens,
+                        )
+                    ]
+                ]
 
             with torch.no_grad():
                 outputs, attn_mask = encoder(clips, clip_indices, attn_mask)
