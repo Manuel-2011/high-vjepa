@@ -21,6 +21,13 @@ logger = logging.getLogger()
 
 MAX_RETRIES = 3
 
+# Buffers that are re-derived from the model config when the model is built (they
+# only exist when `is_causal` is set), so they may legitimately be absent from --
+# or left over in -- a checkpoint without any information being lost. This is what
+# makes it possible to post-train a causal model starting from the released
+# (non-causal) V-JEPA 2 checkpoints.
+RECOMPUTED_BUFFERS = ("temp_attn_mask",)
+
 
 def build_eval_args(
     model_name,
@@ -87,6 +94,22 @@ def build_eval_args(
     return eval_nodes, eval_tasks_per_node, args_eval
 
 
+def load_module_state_dict(module, pretrained_dict, tag, epoch):
+    """Load `pretrained_dict` into `module`, tolerating mismatches that only involve
+    the buffers listed in RECOMPUTED_BUFFERS. Any other missing/unexpected key is
+    still an error, exactly as with a strict load."""
+    missing, unexpected = module.load_state_dict(pretrained_dict, strict=False)
+    recomputed = [k for k in missing + unexpected if k.endswith(RECOMPUTED_BUFFERS)]
+    missing = [k for k in missing if not k.endswith(RECOMPUTED_BUFFERS)]
+    unexpected = [k for k in unexpected if not k.endswith(RECOMPUTED_BUFFERS)]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {tag}: missing keys {missing}, unexpected keys {unexpected}"
+        )
+    msg = "<All keys matched successfully>" if not recomputed else f"<{len(recomputed)} recomputed buffer(s) ignored>"
+    logger.info(f"loaded pretrained {tag} from epoch {epoch} with msg: {msg}")
+
+
 def load_checkpoint(
     r_path,
     encoder,
@@ -104,27 +127,27 @@ def load_checkpoint(
         epoch = checkpoint["epoch"]
 
     # -- loading encoder
-    pretrained_dict = checkpoint["encoder"]
-    msg = encoder.load_state_dict(pretrained_dict)
-    logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
+    load_module_state_dict(encoder, checkpoint["encoder"], "encoder", epoch)
 
     # -- loading predictor
-    pretrained_dict = checkpoint["predictor"]
-    msg = predictor.load_state_dict(pretrained_dict)
-    logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
+    load_module_state_dict(predictor, checkpoint["predictor"], "predictor", epoch)
 
     # -- loading target_encoder
     if target_encoder is not None:
-        print(list(checkpoint.keys()))
-        pretrained_dict = checkpoint["target_encoder"]
-        msg = target_encoder.load_state_dict(pretrained_dict)
-        logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
+        load_module_state_dict(target_encoder, checkpoint["target_encoder"], "target encoder", epoch)
 
     # -- loading optimizer
-    opt.load_state_dict(checkpoint["opt"])
+    try:
+        opt.load_state_dict(checkpoint["opt"])
+        logger.info(f"loaded optimizers from epoch {epoch}")
+    except ValueError as e:
+        # The released V-JEPA 2 checkpoints store optimizer param-groups holding one
+        # extra (pos-embed) parameter per model, which a use_rope model does not
+        # have, so its state cannot be mapped onto our param groups. Restarting the
+        # moment estimates is the sane fallback when post-training from them.
+        logger.warning(f"could not load optimizer state from {r_path} ({e}); starting from a fresh optimizer state")
     if scaler is not None:
         scaler.load_state_dict(checkpoint["scaler"])
-    logger.info(f"loaded optimizers from epoch {epoch}")
     logger.info(f"read-path: {r_path}")
     del checkpoint
 
