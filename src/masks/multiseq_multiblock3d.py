@@ -32,7 +32,9 @@ class SimpleCollator(object):
         self.use_pretrained_model = use_pretrained_model
         self.previous_fps = previous_fps
         self.current_fps = current_fps
-        self.frames_to_skip = int(previous_fps // current_fps)
+        # `previous_fps` is only given when adapting a checkpoint trained at a higher
+        # frame rate than the one we now train at; otherwise no frame is skipped.
+        self.frames_to_skip = int(previous_fps // current_fps) if use_pretrained_model else 1
         self.previous_tubulet_size = previous_tubulet_size
         self.tubelet_size = tubelet_size
         self.patch_size = patch_size
