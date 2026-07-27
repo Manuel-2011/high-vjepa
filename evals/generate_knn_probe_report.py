@@ -80,11 +80,15 @@ WEIGHTINGS = ("uniform", "similarity", "softmax")
 #                usually dominates raw ViT features.
 PREPROCS = ("l2", "center_l2")
 
-METRIC_LABELS = {
-    "top1": "Top-1 accuracy (%)",
-    "top5": "Top-5 accuracy (%)",
-    "mean_class_acc": "Mean per-verb accuracy (%)",
-}
+
+def metric_labels(secondary_topk: int = 5, class_noun: str = "verb") -> Dict[str, str]:
+    """Chart/table labels for the three headline metrics. The class noun is a
+    parameter so the sibling action-group report can reuse these helpers."""
+    return {
+        "top1": "Top-1 accuracy (%)",
+        "topk": f"Top-{secondary_topk} accuracy (%)",
+        "mean_class_acc": f"Mean per-{class_noun} accuracy (%)",
+    }
 
 
 @dataclass
@@ -136,8 +140,8 @@ def load_label_map(json_path: Optional[str]) -> Dict[int, str]:
         return {}
 
 
-def verb_name(idx: int, mapping: Dict[int, str]) -> str:
-    return mapping.get(int(idx), f"verb_{int(idx)}")
+def class_name(idx: int, mapping: Dict[int, str], fallback_prefix: str = "verb") -> str:
+    return mapping.get(int(idx), f"{fallback_prefix}_{int(idx)}")
 
 
 def prepare_split_manifest(
@@ -387,17 +391,22 @@ def knn_scores(
     return scores.numpy()
 
 
-def accuracy_metrics(scores: np.ndarray, val_labels: np.ndarray, num_classes: int) -> Tuple[dict, np.ndarray]:
+def accuracy_metrics(
+    scores: np.ndarray,
+    val_labels: np.ndarray,
+    num_classes: int,
+    secondary_topk: int = 5,
+) -> Tuple[dict, np.ndarray]:
     order = np.argsort(-scores, axis=1, kind="stable")
     top1 = order[:, 0]
-    top5 = order[:, : min(5, scores.shape[1])]
+    topk = order[:, : min(secondary_topk, scores.shape[1])]
 
     correct1 = top1 == val_labels
     # A class that received no vote at all is not a prediction: with small k most
-    # classes score exactly 0, and counting them as top-5 candidates would credit
+    # classes score exactly 0, and counting them as top-k candidates would credit
     # whichever class indices happen to sort first.
-    top5_scores = np.take_along_axis(scores, top5, axis=1)
-    correct5 = ((top5 == val_labels[:, None]) & (top5_scores > 0)).any(axis=1)
+    topk_scores = np.take_along_axis(scores, topk, axis=1)
+    correct_topk = ((topk == val_labels[:, None]) & (topk_scores > 0)).any(axis=1)
 
     per_class = np.full(num_classes, np.nan, dtype=np.float64)
     for cls in np.unique(val_labels):
@@ -406,12 +415,12 @@ def accuracy_metrics(scores: np.ndarray, val_labels: np.ndarray, num_classes: in
 
     metrics = {
         "top1": 100.0 * float(correct1.mean()),
-        "top5": 100.0 * float(correct5.mean()),
+        "topk": 100.0 * float(correct_topk.mean()),
         "mean_class_acc": float(np.nanmean(per_class)),
-        # How many distinct verbs the probe is willing to predict at all. A large k
-        # buys overall accuracy by collapsing onto the frequent verbs, and this
+        # How many distinct classes the probe is willing to predict at all. A large
+        # k buys overall accuracy by collapsing onto the frequent classes, and this
         # column is what makes that visible.
-        "verbs_predicted": int(np.unique(top1).size),
+        "classes_predicted": int(np.unique(top1).size),
     }
     return metrics, top1
 
@@ -423,6 +432,7 @@ def evaluate_model_knn(
     temperature: float,
     num_classes: int,
     device: str,
+    secondary_topk: int = 5,
 ) -> Tuple[List[dict], Dict[str, dict]]:
     """Every (preproc, k, weighting) combination for one model. The expensive
     part - the neighbour search - is done once per preproc and reused.
@@ -447,7 +457,9 @@ def evaluate_model_knn(
                 scores = knn_scores(
                     neighbour_sims, neighbour_idx, train_set.labels, num_classes, k, weighting, temperature
                 )
-                metrics, predictions = accuracy_metrics(scores, val_set.labels, num_classes)
+                metrics, predictions = accuracy_metrics(
+                    scores, val_set.labels, num_classes, secondary_topk=secondary_topk
+                )
                 row = {"preproc": preproc, "k": k, "weighting": weighting, **metrics}
                 rows.append(row)
                 candidate = {
@@ -538,7 +550,8 @@ def per_class_table(
     val_labels: np.ndarray,
     predictions: np.ndarray,
     train_labels: np.ndarray,
-    verb_map: Dict[int, str],
+    label_map: Dict[int, str],
+    fallback_prefix: str = "verb",
 ) -> pd.DataFrame:
     rows = []
     train_counts = Counter(int(v) for v in train_labels)
@@ -546,8 +559,8 @@ def per_class_table(
         cls_mask = val_labels == cls
         rows.append(
             {
-                "verb_idx": int(cls),
-                "verb": verb_name(int(cls), verb_map),
+                "class_idx": int(cls),
+                "class_name": class_name(int(cls), label_map, fallback_prefix),
                 "val_clips": int(cls_mask.sum()),
                 "train_clips": int(train_counts.get(int(cls), 0)),
                 "accuracy": 100.0 * float((predictions[cls_mask] == cls).mean()),
@@ -559,15 +572,16 @@ def per_class_table(
 def confusion_pairs(
     val_labels: np.ndarray,
     predictions: np.ndarray,
-    verb_map: Dict[int, str],
+    label_map: Dict[int, str],
     top_n: int = 10,
+    fallback_prefix: str = "verb",
 ) -> pd.DataFrame:
     wrong = predictions != val_labels
     counts = Counter(zip(val_labels[wrong].tolist(), predictions[wrong].tolist()))
     rows = [
         {
-            "true_verb": verb_name(true_cls, verb_map),
-            "predicted_verb": verb_name(pred_cls, verb_map),
+            "true_class": class_name(true_cls, label_map, fallback_prefix),
+            "predicted_class": class_name(pred_cls, label_map, fallback_prefix),
             "count": count,
             "share_of_errors": 100.0 * count / max(1, int(wrong.sum())),
         }
@@ -576,22 +590,29 @@ def confusion_pairs(
     return pd.DataFrame(rows)
 
 
-def baseline_metrics(train_labels: np.ndarray, val_labels: np.ndarray, num_classes: int) -> dict:
+def baseline_metrics(
+    train_labels: np.ndarray,
+    val_labels: np.ndarray,
+    num_classes: int,
+    secondary_topk: int = 5,
+) -> dict:
     """Two reference points the probe has to beat: always predicting the most
-    frequent train verb, and uniform random guessing."""
+    frequent train class, and uniform random guessing."""
     if train_labels.size == 0 or val_labels.size == 0:
         return {}
-    majority_cls = Counter(int(v) for v in train_labels).most_common(1)[0][0]
-    top5_classes = [cls for cls, _ in Counter(int(v) for v in train_labels).most_common(5)]
+    counts = Counter(int(v) for v in train_labels)
+    majority_cls = counts.most_common(1)[0][0]
+    topk_classes = [cls for cls, _ in counts.most_common(secondary_topk)]
     return {
-        "majority_verb_idx": majority_cls,
+        "majority_class_idx": majority_cls,
         "majority_top1": 100.0 * float((val_labels == majority_cls).mean()),
-        "majority_top5": 100.0 * float(np.isin(val_labels, top5_classes).mean()),
+        "majority_topk": 100.0 * float(np.isin(val_labels, topk_classes).mean()),
         "chance_top1": 100.0 / num_classes,
+        "secondary_topk": secondary_topk,
     }
 
 
-def save_accuracy_vs_k_chart(results_df: pd.DataFrame, output_path: Path) -> None:
+def save_accuracy_vs_k_chart(results_df: pd.DataFrame, output_path: Path, class_noun: str = "verb") -> None:
     if results_df.empty:
         return
 
@@ -621,21 +642,28 @@ def save_accuracy_vs_k_chart(results_df: pd.DataFrame, output_path: Path) -> Non
         ax.set_title(f"Features: {preproc}")
         ax.grid(alpha=0.2)
 
-    axes[0].set_ylabel("Verb top-1 accuracy (%)")
+    axes[0].set_ylabel(f"{class_noun.capitalize()} top-1 accuracy (%)")
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=min(3, max(1, len(labels))), bbox_to_anchor=(0.5, 1.12), fontsize=9)
-    fig.suptitle("kNN verb probing: sensitivity to k", y=1.02)
+    fig.suptitle(f"kNN {class_noun} probing: sensitivity to k", y=1.02)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_headline_chart(best_rows: List[dict], baselines: dict, output_path: Path) -> None:
+def save_headline_chart(
+    best_rows: List[dict],
+    baselines: dict,
+    output_path: Path,
+    class_noun: str = "verb",
+    secondary_topk: int = 5,
+) -> None:
     if not best_rows:
         return
 
+    labels_by_metric = metric_labels(secondary_topk, class_noun)
     models = [row["model"] for row in best_rows]
-    metrics = list(METRIC_LABELS)
+    metrics = list(labels_by_metric)
     fig, ax = plt.subplots(figsize=(max(7, 2.4 * len(models) + 3), 5.4), dpi=150)
     x = np.arange(len(metrics))
     width = 0.8 / max(1, len(models))
@@ -646,13 +674,13 @@ def save_headline_chart(best_rows: List[dict], baselines: dict, output_path: Pat
         bars = ax.bar(x + offset, values, width=width, label=f"{row['model']} (k={row['k']}, {row['weighting']})")
         ax.bar_label(bars, fmt="%.1f", fontsize=8, padding=2)
 
-    ax.set_ylim(0, max(1.0, max(row["top5"] for row in best_rows)) * 1.2)
+    ax.set_ylim(0, max(1.0, max(row["topk"] for row in best_rows)) * 1.2)
     if baselines:
         ax.axhline(baselines["majority_top1"], color="#64748b", linestyle="--", linewidth=1.2)
         ax.text(
             -0.48,
             baselines["majority_top1"],
-            f"majority verb ({baselines['majority_top1']:.1f}%)",
+            f"majority {class_noun} ({baselines['majority_top1']:.1f}%)",
             va="bottom",
             ha="left",
             fontsize=8,
@@ -660,9 +688,9 @@ def save_headline_chart(best_rows: List[dict], baselines: dict, output_path: Pat
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels([METRIC_LABELS[m] for m in metrics], fontsize=9)
+    ax.set_xticklabels([labels_by_metric[m] for m in metrics], fontsize=9)
     ax.set_ylabel("Accuracy (%)")
-    ax.set_title("Best kNN verb probe per model")
+    ax.set_title(f"Best kNN {class_noun} probe per model")
     ax.legend(fontsize=9)
     ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
@@ -670,29 +698,37 @@ def save_headline_chart(best_rows: List[dict], baselines: dict, output_path: Pat
     plt.close(fig)
 
 
-def save_per_class_heatmap(per_class_frames: Dict[str, pd.DataFrame], output_path: Path, top_n: int = 20) -> None:
+def save_per_class_heatmap(
+    per_class_frames: Dict[str, pd.DataFrame],
+    output_path: Path,
+    top_n: int = 20,
+    class_noun: str = "verb",
+) -> None:
     if not per_class_frames:
         return
 
     reference = next(iter(per_class_frames.values()))
-    verbs = reference.head(top_n)
-    if verbs.empty:
+    classes = reference.head(top_n)
+    if classes.empty:
         return
 
     models = list(per_class_frames)
-    matrix = np.full((len(models), len(verbs)), np.nan)
+    matrix = np.full((len(models), len(classes)), np.nan)
     for row_idx, model in enumerate(models):
-        frame = per_class_frames[model].set_index("verb_idx")
-        for col_idx, verb_idx in enumerate(verbs["verb_idx"]):
-            if verb_idx in frame.index:
-                matrix[row_idx, col_idx] = frame.loc[verb_idx, "accuracy"]
+        frame = per_class_frames[model].set_index("class_idx")
+        for col_idx, class_idx in enumerate(classes["class_idx"]):
+            if class_idx in frame.index:
+                matrix[row_idx, col_idx] = frame.loc[class_idx, "accuracy"]
 
     fig_height = max(2.6, 0.7 * len(models) + 1.8)
-    fig, ax = plt.subplots(figsize=(max(9, 0.62 * len(verbs) + 3), fig_height), dpi=150)
+    fig, ax = plt.subplots(figsize=(max(9, 0.62 * len(classes) + 3), fig_height), dpi=150)
     image = ax.imshow(matrix, cmap="viridis", vmin=0, vmax=100, aspect="auto")
-    ax.set_xticks(np.arange(len(verbs)))
+    ax.set_xticks(np.arange(len(classes)))
     ax.set_xticklabels(
-        [f"{row.verb}\n(n={row.val_clips})" for row in verbs.itertuples()], rotation=45, ha="right", fontsize=8
+        [f"{row.class_name}\n(n={row.val_clips})" for row in classes.itertuples()],
+        rotation=45,
+        ha="right",
+        fontsize=8,
     )
     ax.set_yticks(np.arange(len(models)))
     ax.set_yticklabels(models, fontsize=9)
@@ -708,9 +744,10 @@ def save_per_class_heatmap(per_class_frames: Dict[str, pd.DataFrame], output_pat
                     fontsize=7,
                     color="white" if matrix[row_idx, col_idx] < 60 else "black",
                 )
-    fig.colorbar(image, ax=ax, label="Per-verb top-1 accuracy (%)", fraction=0.025, pad=0.02)
+    fig.colorbar(image, ax=ax, label=f"Per-{class_noun} top-1 accuracy (%)", fraction=0.025, pad=0.02)
     ax.set_title(
-        f"Per-verb accuracy on the {len(verbs)} most frequent validation verbs (top-1-best config per model)"
+        f"Per-{class_noun} accuracy on the {len(classes)} most frequent validation "
+        f"{class_noun}s (top-1-best config per model)"
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
@@ -779,7 +816,7 @@ def generate_markdown_report(
         lines.append(
             f"- Mean per-verb accuracy is only **{fmt_pct(leader['mean_class_acc'])}%** against "
             f"**{fmt_pct(leader['top1'])}%** overall: the probe rides EPIC-KITCHENS' heavy verb "
-            f"imbalance, predicting just {leader['verbs_predicted']} distinct verbs out of "
+            f"imbalance, predicting just {leader['classes_predicted']} distinct verbs out of "
             f"{split_infos['val']['num_verbs_present']} present in the validation split."
         )
         leader_balanced = model_meta[leader["model"]].get("balanced_row")
@@ -788,7 +825,7 @@ def generate_markdown_report(
                 f"- The trade-off is explicit: at k={leader_balanced['k']} "
                 f"({leader_balanced['weighting']}, {leader_balanced['preproc']}) the same features "
                 f"reach **{fmt_pct(leader_balanced['mean_class_acc'])}% mean per-verb** across "
-                f"{leader_balanced['verbs_predicted']} predicted verbs, at the cost of "
+                f"{leader_balanced['classes_predicted']} predicted verbs, at the cost of "
                 f"{leader_balanced['top1'] - leader['top1']:+.2f} points of top-1. Small k spreads "
                 "predictions over the tail; large k collapses onto `take`/`put`/`wash`."
             )
@@ -809,14 +846,14 @@ def generate_markdown_report(
         for row in best_rows:
             meta = model_meta[row["model"]]
             lines.append(
-                f"| {row['model']} | **{fmt_pct(row['top1'])}** | {fmt_pct(row['top5'])} | "
-                f"{fmt_pct(row['mean_class_acc'])} | {row['verbs_predicted']} | {row['k']} | "
+                f"| {row['model']} | **{fmt_pct(row['top1'])}** | {fmt_pct(row['topk'])} | "
+                f"{fmt_pct(row['mean_class_acc'])} | {row['classes_predicted']} | {row['k']} | "
                 f"{row['weighting']} | {row['preproc']} | {meta.get('embed_dim', 'n/a')} |"
             )
         if baselines:
             lines.append(
                 f"| _majority verb baseline_ | {fmt_pct(baselines['majority_top1'])} | "
-                f"{fmt_pct(baselines['majority_top5'])} | "
+                f"{fmt_pct(baselines['majority_topk'])} | "
                 f"{fmt_pct(100.0 / max(1, split_infos['val']['num_verbs_present']))} | 1 | - | - | - | - |"
             )
             lines.append(
@@ -843,7 +880,7 @@ def generate_markdown_report(
             for row in sorted(balanced_rows, key=lambda r: r["mean_class_acc"], reverse=True):
                 lines.append(
                     f"| {row['model']} | **{fmt_pct(row['mean_class_acc'])}** | {fmt_pct(row['top1'])} | "
-                    f"{fmt_pct(row['top5'])} | {row['verbs_predicted']} | {row['k']} | "
+                    f"{fmt_pct(row['topk'])} | {row['classes_predicted']} | {row['k']} | "
                     f"{row['weighting']} | {row['preproc']} |"
                 )
             lines.append("")
@@ -949,7 +986,7 @@ def generate_markdown_report(
         for row in grid.itertuples():
             lines.append(
                 f"| {row.model} | {row.preproc} | {row.weighting} | {row.k} | {fmt_pct(row.top1)} | "
-                f"{fmt_pct(row.top5)} | {fmt_pct(row.mean_class_acc)} | {row.verbs_predicted} |"
+                f"{fmt_pct(row.topk)} | {fmt_pct(row.mean_class_acc)} | {row.classes_predicted} |"
             )
         lines.append("")
         spread = (
@@ -1003,8 +1040,8 @@ def generate_markdown_report(
             lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
             for (_, good), (_, bad) in zip(best_verbs.iterrows(), worst_verbs.iterrows()):
                 lines.append(
-                    f"| {good['verb']} | {fmt_pct(good['accuracy'])} | {good['val_clips']} | "
-                    f"{good['train_clips']} | | {bad['verb']} | {fmt_pct(bad['accuracy'])} | "
+                    f"| {good['class_name']} | {fmt_pct(good['accuracy'])} | {good['val_clips']} | "
+                    f"{good['train_clips']} | | {bad['class_name']} | {fmt_pct(bad['accuracy'])} | "
                     f"{bad['val_clips']} | {bad['train_clips']} |"
                 )
             lines.append("")
@@ -1016,7 +1053,7 @@ def generate_markdown_report(
                 lines.append("| --- | --- | --- | --- |")
                 for row in conf.itertuples():
                     lines.append(
-                        f"| {row.true_verb} | {row.predicted_verb} | {row.count} | "
+                        f"| {row.true_class} | {row.predicted_class} | {row.count} | "
                         f"{fmt_pct(row.share_of_errors)} |"
                     )
                 lines.append("")
@@ -1326,9 +1363,9 @@ def main() -> None:
                 model_name,
                 criterion,
                 winner["metrics"]["top1"],
-                winner["metrics"]["top5"],
+                winner["metrics"]["topk"],
                 winner["metrics"]["mean_class_acc"],
-                winner["metrics"]["verbs_predicted"],
+                winner["metrics"]["classes_predicted"],
                 winner["k"],
                 winner["weighting"],
                 winner["preproc"],
