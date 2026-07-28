@@ -1,0 +1,108 @@
+# Causal (future-prediction) post-training at 0.5fps on top of causal prediction
+# at 4fps on top of the ORIGINAL V-JEPA 2 ViT-L
+# checkpoint (models/vitl.pt), predicting at the same 4 fps rate the released
+# model was pre-trained with.
+app: vjepa
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 1
+mem_per_gpu: 46G
+folder: preliminary_experiments/EK100-vjepa-16f-0.5fps-causal-after-causal-4fps-on-original-vjepa2-ckpt
+data:
+  dataset_type: VideoDataset
+  datasets:
+  - data/ek100_64frames_4fps_train.csv
+  - data/ek55_64frames_4fps_train.csv
+  datasets_weights:
+  - 0.5
+  - 0.5
+  batch_size: 64
+  crop_size: 256
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 0.5
+  num_workers: 8
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+# NOTE: with `model.is_causal: true` the masks below are never used (train.py builds
+# a SimpleCollator and the predictor ignores mask tokens). They still size the
+# predictor's mask-token list -- num_mask_tokens = len(mask) * len(dataset_fpcs) = 4
+# here vs. 10 in models/vitl.pt -- and load_checkpoint drops the surplus 6, which in
+# the released checkpoint are all exactly zero (never trained).
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  load_checkpoint: true
+  read_checkpoint: preliminary_experiments/EK100-vjepa-16f-4fps-causal-original-vjepa2-ckpt/latest.pt
+  save_every_freq: 50
+  seed: 239
+  use_sdpa: true
+  use_pretrained_model:
+    enabled: true
+    previous_fps: 4
+    previous_tubulet_size: 2
+model:
+  is_causal: true
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 60 # checkpoint is at epoch 50 + 10 epochs for this training
+  final_lr: 0.000525
+  final_weight_decay: 0.04
+  ipe_scale: 1.25
+  lr: 0.000525
+  start_lr: 0.0001
+  warmup: 40
+  weight_decay: 0.04
