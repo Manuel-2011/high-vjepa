@@ -97,6 +97,7 @@ ACTION_GROUPS: List[Tuple[str, str, List[str]]] = [
             "set",
             "move",
             "throw",
+            "gather",
         ],
     ),
     (
@@ -107,7 +108,6 @@ ACTION_GROUPS: List[Tuple[str, str, List[str]]] = [
             "close",
             "lock",
             "unlock",
-            "cover",
             "uncover",
             "wrap",
             "unwrap",
@@ -139,6 +139,7 @@ ACTION_GROUPS: List[Tuple[str, str, List[str]]] = [
             "turn-down",
             "hang",
             "sort",
+            "fold",
         ],
     ),
     (
