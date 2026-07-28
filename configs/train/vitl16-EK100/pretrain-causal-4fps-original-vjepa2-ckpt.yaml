@@ -41,12 +41,11 @@ data_aug:
   reprob: 0.0
 loss:
   loss_exp: 1.0
-# NOTE: with `model.is_causal: true` the masks below are never used (train.py
-# builds a SimpleCollator and the predictor ignores mask tokens). They are kept
-# only to size the predictor's mask-token ParameterList, which must match the
-# released checkpoint: num_mask_tokens = len(mask) * len(dataset_fpcs) = 5 * 2
-# = 10, i.e. the 10 mask tokens stored in models/vitl.pt. Changing the number
-# of mask blocks or datasets here breaks loading the original predictor.
+# NOTE: with `model.is_causal: true` the masks below are never used (train.py builds
+# a SimpleCollator and the predictor ignores mask tokens). They still size the
+# predictor's mask-token list -- num_mask_tokens = len(mask) * len(dataset_fpcs) = 4
+# here vs. 10 in models/vitl.pt -- and load_checkpoint drops the surplus 6, which in
+# the released checkpoint are all exactly zero (never trained).
 mask:
 - aspect_ratio:
   - 0.75
@@ -58,45 +57,6 @@ mask:
   spatial_scale:
   - 0.15
   - 0.15
-  temporal_scale:
-  - 1.0
-  - 1.0
-- aspect_ratio:
-  - 0.75
-  - 1.5
-  full_complement: false
-  max_keep: null
-  max_temporal_keep: 1.0
-  num_blocks: 2
-  spatial_scale:
-  - 0.7
-  - 0.7
-  temporal_scale:
-  - 1.0
-  - 1.0
-- aspect_ratio:
-  - 0.75
-  - 1.5
-  full_complement: false
-  max_keep: null
-  max_temporal_keep: 1.0
-  num_blocks: 8
-  spatial_scale:
-  - 0.15
-  - 0.15
-  temporal_scale:
-  - 1.0
-  - 1.0
-- aspect_ratio:
-  - 0.75
-  - 1.5
-  full_complement: false
-  max_keep: null
-  max_temporal_keep: 1.0
-  num_blocks: 2
-  spatial_scale:
-  - 0.7
-  - 0.7
   temporal_scale:
   - 1.0
   - 1.0

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import re
 import sys
 import warnings
 
@@ -21,12 +22,19 @@ logger = logging.getLogger()
 
 MAX_RETRIES = 3
 
-# Buffers that are re-derived from the model config when the model is built (they
-# only exist when `is_causal` is set), so they may legitimately be absent from --
-# or left over in -- a checkpoint without any information being lost. This is what
-# makes it possible to post-train a causal model starting from the released
-# (non-causal) V-JEPA 2 checkpoints.
+# Buffers that are re-derived from the model config when the model is built (see
+# RoPEAttention), so they may legitimately be absent from -- or left over in -- a
+# checkpoint without any information being lost. This is what makes it possible to
+# post-train starting from the released V-JEPA 2 checkpoints, which predate them.
 RECOMPUTED_BUFFERS = ("temp_attn_mask",)
+
+# The predictor's mask-token list is sized `len(mask) * len(dataset_fpcs)`, so a
+# checkpoint trained on a different data mixture carries a different number of them
+# (the released V-JEPA 2 checkpoints hold 10). Only `mask_index < len(dataset_fpcs)`
+# is ever used at train time -- see PredictorMultiSeqWrapper -- so the surplus
+# trailing tokens of a bigger checkpoint can be dropped without losing anything
+# this run would have used.
+MASK_TOKEN_KEY = re.compile(r"(.*\.)?mask_tokens\.\d+$")
 
 
 def build_eval_args(
@@ -96,15 +104,25 @@ def build_eval_args(
 
 def load_module_state_dict(module, pretrained_dict, tag, epoch):
     """Load `pretrained_dict` into `module`, tolerating mismatches that only involve
-    the buffers listed in RECOMPUTED_BUFFERS. Any other missing/unexpected key is
-    still an error, exactly as with a strict load."""
+    the buffers listed in RECOMPUTED_BUFFERS or surplus trailing mask tokens. Any
+    other missing/unexpected key is still an error, exactly as with a strict load."""
     missing, unexpected = module.load_state_dict(pretrained_dict, strict=False)
     recomputed = [k for k in missing + unexpected if k.endswith(RECOMPUTED_BUFFERS)]
     missing = [k for k in missing if not k.endswith(RECOMPUTED_BUFFERS)]
     unexpected = [k for k in unexpected if not k.endswith(RECOMPUTED_BUFFERS)]
+    # Mask tokens are indexed, so the ones this model does have were already loaded
+    # from their same-index counterpart in the checkpoint.
+    surplus_mask_tokens = [k for k in unexpected if MASK_TOKEN_KEY.match(k)]
+    unexpected = [k for k in unexpected if k not in surplus_mask_tokens]
     if missing or unexpected:
         raise RuntimeError(
             f"Error(s) in loading state_dict for {tag}: missing keys {missing}, unexpected keys {unexpected}"
+        )
+    if surplus_mask_tokens:
+        logger.warning(
+            f"{tag}: checkpoint holds {len(surplus_mask_tokens)} more mask token(s) than this config builds "
+            f"(len(mask) * len(dataset_fpcs)); dropped {surplus_mask_tokens}. Only mask_index < len(dataset_fpcs) "
+            f"is ever used, so this is harmless as long as the retained tokens cover every dataset."
         )
     msg = "<All keys matched successfully>" if not recomputed else f"<{len(recomputed)} recomputed buffer(s) ignored>"
     logger.info(f"loaded pretrained {tag} from epoch {epoch} with msg: {msg}")
