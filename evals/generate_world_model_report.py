@@ -77,6 +77,7 @@ from app.vjepa.utils import init_video_model, load_module_state_dict
 from evals.generate_patch_embedding_report import (
     DEFAULT_NORMALIZATION,
     MODELS_CONFIG,
+    apply_pretrained_frame_skip,
     load_config,
     load_manifest,
     sample_rows,
@@ -141,10 +142,25 @@ class RolloutGeometry:
 
     All of it is derived from the model's own pretraining config, so the rollout
     can never present the encoder with a clip shape it was not trained on.
+
+    Frame spacing is *not* necessarily uniform. A model post-trained from a
+    checkpoint that was pretrained at a higher frame rate
+    (`meta.use_pretrained_model`) sees clips on two different timescales at once:
+    the frames inside one tubelet stay at the backbone's original `previous_fps`,
+    while consecutive tubelets are spaced at the new, coarser `fps`. The data
+    pipeline builds this by sampling at `previous_fps` and keeping only the
+    leading `tubelet_size` frames of every `frames_to_skip`-sized chunk (see
+    `SimpleCollator` in src/masks/multiseq_multiblock3d.py). So for
+    `previous_fps: 4`, `fps: 0.5`, `tubelet_size: 2` a tubelet is two frames
+    0.25s apart, and tubelet starts are 2s apart - which is what an
+    autoregressive step advances by.
     """
 
-    fps: float
-    tubelet_size: int
+    fps: float  # config `data.fps`: the rate tubelet *starts* advance at
+    sampling_fps: float  # rate frames are decoded at (previous_fps when post-training)
+    tubelet_size: int  # frames the encoder groups into one temporal token
+    frames_per_token: int  # sampled frames advanced per temporal token
+    frames_to_skip: int  # sampled frames per chunk (1 when not post-training)
     patch_size: int
     crop_size: int
     frames_per_clip: int  # max(dataset_fpcs): the trained clip length, in frames
@@ -153,15 +169,37 @@ class RolloutGeometry:
     context_tokens: int  # n_ctx = N_t - 1: temporal tokens the predictor conditions on
     num_steps: int  # autoregressive steps taken
     is_causal: bool
+    uses_pretrained_backbone: bool
 
     @property
     def step_seconds(self) -> float:
-        """Wall-clock video time advanced by one autoregressive step."""
-        return self.tubelet_size / self.fps
+        """Video time advanced by one autoregressive step, i.e. between the start
+        of one tubelet and the start of the next.
+
+        Without post-training this is `tubelet_size / fps`; with it, the frame
+        skip makes it `frames_to_skip / previous_fps`, which is `1 / fps`."""
+        return self.frames_per_token / self.sampling_fps
+
+    @property
+    def intra_tubelet_seconds(self) -> float:
+        """Gap between two consecutive frames *inside* one tubelet. Zero for a
+        single-frame tubelet."""
+        return 0.0 if self.tubelet_size < 2 else 1.0 / self.sampling_fps
+
+    @property
+    def tubelet_span_seconds(self) -> float:
+        """Video time from the first to the last frame of one tubelet."""
+        return (self.tubelet_size - 1) / self.sampling_fps
+
+    @property
+    def window_seconds(self) -> float:
+        """Video time spanned by a full trained clip, first frame to last."""
+        return (self.window_tokens - 1) * self.step_seconds + self.tubelet_span_seconds
 
     @property
     def context_seconds(self) -> float:
-        return self.context_tokens * self.step_seconds
+        """Video time spanned by the tokens the predictor conditions on."""
+        return (self.context_tokens - 1) * self.step_seconds + self.tubelet_span_seconds
 
     @property
     def horizon_seconds(self) -> float:
@@ -178,7 +216,17 @@ class RolloutGeometry:
         return self.window_tokens + self.num_steps
 
     @property
+    def total_sampled_frames(self) -> int:
+        """Frames to decode at `sampling_fps`, before any frame skip.
+
+        Whole chunks are decoded even though the tail of the last one is
+        discarded, because `apply_pretrained_frame_skip` drops a trailing partial
+        chunk - shaving those frames off would cost a whole temporal token."""
+        return self.total_tokens * self.frames_per_token
+
+    @property
     def total_frames(self) -> int:
+        """Frames the encoder actually sees, after the frame skip."""
         return self.total_tokens * self.tubelet_size
 
     def lead_seconds(self, step: int) -> float:
@@ -271,12 +319,54 @@ def build_geometry(config: dict, horizon_seconds: float) -> RolloutGeometry:
             "predict a future token from."
         )
 
-    step_seconds = tubelet_size / fps
+    # A model post-trained from a higher-frame-rate backbone samples at
+    # `previous_fps` and keeps only the leading frames of every chunk, which makes
+    # frame spacing non-uniform: dense inside a tubelet, sparse between tubelets.
+    # Mirrors init_data + SimpleCollator in app/vjepa/train.py.
+    use_pretrained_cfg = config.get("meta", {}).get("use_pretrained_model") or {}
+    uses_pretrained_backbone = bool(use_pretrained_cfg.get("enabled", False))
+    if uses_pretrained_backbone:
+        previous_fps = float(use_pretrained_cfg["previous_fps"])
+        frames_to_skip = int(previous_fps // fps)
+        if frames_to_skip < 1:
+            raise ValueError(
+                f"use_pretrained_model.previous_fps ({previous_fps:g}) is below data.fps ({fps:g}); "
+                "there is nothing to skip."
+            )
+        # train.py builds SimpleCollator with `previous_tubulet_size=tubelet_size`,
+        # ignoring the config key of the same name, so the two must agree or the
+        # clips this report builds would not be the clips the model was trained
+        # on. Every config in the repo satisfies this; fail loudly if one stops.
+        declared = int(use_pretrained_cfg.get("previous_tubulet_size", tubelet_size))
+        if declared != tubelet_size:
+            raise ValueError(
+                f"use_pretrained_model.previous_tubulet_size ({declared}) != data.tubelet_size "
+                f"({tubelet_size}). app/vjepa/train.py passes tubelet_size to SimpleCollator and "
+                "ignores the config key, so training kept a different number of frames per chunk than "
+                "this config declares; the intended clip layout is ambiguous."
+            )
+        sampling_fps = previous_fps
+        frames_per_token = frames_to_skip
+    else:
+        frames_to_skip = 1
+        sampling_fps = fps
+        frames_per_token = tubelet_size
+
+    if frames_per_token < tubelet_size:
+        raise ValueError(
+            f"a temporal token spans {tubelet_size} frames but only {frames_per_token} are sampled per "
+            "token; the tubelet cannot be filled."
+        )
+
+    step_seconds = frames_per_token / sampling_fps
     num_steps = max(1, int(round(horizon_seconds / step_seconds)))
 
     return RolloutGeometry(
         fps=fps,
+        sampling_fps=sampling_fps,
         tubelet_size=tubelet_size,
+        frames_per_token=frames_per_token,
+        frames_to_skip=frames_to_skip,
         patch_size=patch_size,
         crop_size=crop_size,
         frames_per_clip=frames_per_clip,
@@ -288,6 +378,7 @@ def build_geometry(config: dict, horizon_seconds: float) -> RolloutGeometry:
         context_tokens=window_tokens - 1,
         num_steps=num_steps,
         is_causal=bool(args_model.get("is_causal", False)),
+        uses_pretrained_backbone=uses_pretrained_backbone,
     )
 
 
@@ -376,16 +467,20 @@ def prepare_world_model(config: dict, checkpoint_path: str, device: str) -> Mode
 
 def frame_stride(geom: RolloutGeometry, video_fps: int) -> Optional[int]:
     """Frames of the source video per sampled frame, as `VideoDataset` computes it
-    (`video_fps // fps`). None if the video is slower than the model's fps, in
-    which case the model's temporal spacing cannot be reproduced at all."""
-    stride = int(video_fps // geom.fps)
+    (`video_fps // fps`). None if the video is slower than the rate the model
+    samples at, in which case its temporal spacing cannot be reproduced at all.
+
+    Note this uses `sampling_fps`, not `fps`: a post-trained model decodes at its
+    backbone's original frame rate and thins the result afterwards, so it needs a
+    *finer* stride - and more source footage - than its nominal `fps` suggests."""
+    stride = int(video_fps // geom.sampling_fps)
     return stride if stride >= 1 else None
 
 
 def required_raw_frames(geom: RolloutGeometry, video_fps: int) -> Optional[int]:
     """Source frames a video must hold for one full rollout at this geometry."""
     stride = frame_stride(geom, video_fps)
-    return None if stride is None else geom.total_frames * stride
+    return None if stride is None else geom.total_sampled_frames * stride
 
 
 def select_videos(
@@ -465,11 +560,18 @@ def load_long_clip(
     transform,
     rng: np.random.Generator,
 ) -> Optional[Tuple[torch.Tensor, int]]:
-    """Decode one clip of `geom.total_frames` frames sampled at `geom.fps`.
+    """Decode one clip laid out exactly as this model's training clips were.
 
-    The frame stride is derived from the video's own frame rate exactly as
-    `src/datasets/video_dataset.py` does (`video_fps // fps`), so a clip sampled
-    here has the same temporal spacing as the clips the model was trained on.
+    Two stages, mirroring the training data pipeline:
+      1. Decode `geom.total_sampled_frames` frames at `geom.sampling_fps`, with the
+         stride derived from the video's own frame rate as
+         `src/datasets/video_dataset.py` does (`video_fps // fps`).
+      2. For a model post-trained from a higher-frame-rate backbone, thin those
+         frames per chunk the way `SimpleCollator` does, keeping the leading
+         `tubelet_size` of every `frames_to_skip`. This is what makes frame
+         spacing dense inside a tubelet and sparse between tubelets.
+    Without post-training stage 2 is a no-op and the spacing is uniform.
+
     Returns (clip, start_frame) or None if the video is unusable/too short.
     """
     if not os.path.exists(video_path):
@@ -501,7 +603,7 @@ def load_long_clip(
     # `select_videos` already guaranteed this, so reaching here means the video
     # changed underneath the run - worth an error rather than a quiet skip,
     # because it makes this model's clip list diverge from the others'.
-    span = geom.total_frames * frame_step
+    span = geom.total_sampled_frames * frame_step
     if len(reader) < span:
         logger.error(
             "%s holds %d frames but %d are needed for a %.0fs rollout; skipping",
@@ -514,11 +616,11 @@ def load_long_clip(
 
     # Draw the start as a *fraction* of the usable range rather than an absolute
     # frame, so that a given video is entered at the same point for every model.
-    # Models with different fps need different amounts of footage for the same
-    # horizon, so the absolute frame still differs slightly, but the clips remain
-    # aligned enough for a fair cross-model comparison.
+    # Models sampling at different rates need different amounts of footage for the
+    # same horizon, so the absolute frame still differs slightly, but the clips
+    # remain aligned enough for a fair cross-model comparison.
     start = int(round(float(rng.random()) * (len(reader) - span)))
-    indices = start + np.arange(0, span, frame_step, dtype=np.int64)[: geom.total_frames]
+    indices = start + np.arange(0, span, frame_step, dtype=np.int64)[: geom.total_sampled_frames]
 
     try:
         frames = reader.get_batch(indices).asnumpy()
@@ -532,11 +634,32 @@ def load_long_clip(
         return None
 
     clip = views[0]  # (C, T, H, W)
-    if clip.shape[1] != geom.total_frames:
+    if clip.shape[1] != geom.total_sampled_frames:
         logger.warning(
-            "%s produced %d frames, expected %d; skipping", video_path, clip.shape[1], geom.total_frames
+            "%s produced %d frames, expected %d; skipping",
+            video_path,
+            clip.shape[1],
+            geom.total_sampled_frames,
         )
         return None
+
+    if geom.uses_pretrained_backbone:
+        # Thin per chunk after the transform, matching SimpleCollator's ordering
+        # (the dataset transforms the full densely-sampled clip, the collator
+        # thins it). The eval transform is per-frame, so the order is immaterial
+        # to the pixels - but matching it keeps this path auditable against
+        # training.
+        clip = apply_pretrained_frame_skip(
+            clip.unsqueeze(0), geom.frames_to_skip, geom.tubelet_size
+        ).squeeze(0)
+        if clip.shape[1] != geom.total_frames:
+            logger.error(
+                "%s: frame skip produced %d frames, expected %d; skipping",
+                video_path,
+                clip.shape[1],
+                geom.total_frames,
+            )
+            return None
     return clip, start
 
 
@@ -1450,28 +1573,52 @@ def generate_markdown_report(
     lines.append("### Per-model geometry")
     lines.append("")
     lines.append(
-        "| Model | Config | Checkpoint | Epoch | Causal | fps | Tubelet | Patch | Crop | Spatial tokens | "
-        "Context window | Step (s) | Steps | Clip decoded |"
+        "Frame spacing is not uniform for every model. A model post-trained from a checkpoint that was "
+        "pretrained at a higher frame rate (`meta.use_pretrained_model`) sees **two timescales at once**: "
+        "the frames inside one tubelet stay at the backbone's original `previous_fps`, while consecutive "
+        "tubelets are spaced at the new, coarser `fps`. The data pipeline builds this by decoding at "
+        "`previous_fps` and keeping only the leading `tubelet_size` frames of every `frames_to_skip` "
+        "(`SimpleCollator`), and this report reproduces it frame for frame. An autoregressive step "
+        "advances by one *tubelet start*, so it is the between-tubelet column that sets the step size."
     )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("")
+    lines.append(
+        "| Model | Config | Causal | Post-trained | Decode fps | Tubelet | Within-tubelet gap (s) | "
+        "Between-tubelet step (s) | Spatial tokens | Context window | Trained window | Steps | "
+        "Source frames |"
+    )
+    lines.append(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
+    for name, meta in model_meta.items():
+        geom = meta.get("geometry")
+        if geom is None:
+            continue
+        intra = f"{geom.intra_tubelet_seconds:.2f}" if geom.tubelet_size > 1 else "n/a (1 frame)"
+        lines.append(
+            f"| {name} | `{meta['config']}` | {'yes' if geom.is_causal else 'no'} | "
+            f"{'yes' if geom.uses_pretrained_backbone else 'no'} | {geom.sampling_fps:g} | "
+            f"{geom.tubelet_size} frame(s) | {intra} | {geom.step_seconds:.2f} | "
+            f"{geom.spatial_tokens} | {geom.context_tokens} tok / {geom.context_seconds:.2f}s | "
+            f"{geom.window_tokens} tok / {geom.window_seconds:.2f}s | {geom.num_steps} | "
+            f"{geom.total_sampled_frames} @ {geom.sampling_fps:g} fps -> {geom.total_frames} kept |"
+        )
+    lines.append("")
+    lines.append("| Model | Checkpoint | Epoch | Patch | Crop |")
+    lines.append("| --- | --- | --- | --- | --- |")
     for name, meta in model_meta.items():
         geom = meta.get("geometry")
         if geom is None:
             continue
         lines.append(
-            f"| {name} | `{meta['config']}` | `{meta['checkpoint']}` | {meta.get('epoch', 'n/a')} | "
-            f"{'yes' if geom.is_causal else 'no'} | {geom.fps:g} | {geom.tubelet_size} | "
-            f"{geom.patch_size} | {geom.crop_size} | {geom.spatial_tokens} | "
-            f"{geom.context_tokens} tok / {geom.context_seconds:.1f}s | {geom.step_seconds:.2f} | "
-            f"{geom.num_steps} | {geom.total_frames} frames / "
-            f"{geom.total_frames / geom.fps:.0f}s |"
+            f"| {name} | `{meta['checkpoint']}` | {meta.get('epoch', 'n/a')} | {geom.patch_size} | "
+            f"{geom.crop_size} |"
         )
     lines.append("")
     lines.append(
-        "> A model's `fps` and `tubelet_size` fix how much video time one step covers, so a fixed "
-        "~1-minute horizon means very different numbers of steps per model (e.g. 0.5s/step needs 120 "
-        "steps, 2s/step needs 30). The per-frame tables are indexed by *lead time in seconds* for that "
-        "reason; the step count is reported next to every average."
+        "> The step size fixes how many steps a fixed ~1-minute horizon takes, and it varies a lot "
+        "between models (0.5s/step needs 120 steps, 2s/step needs 30). The per-frame tables are indexed "
+        "by *lead time in seconds* for that reason, and the step count is reported next to every average."
     )
     lines.append("")
 
