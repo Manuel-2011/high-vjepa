@@ -123,7 +123,34 @@ METRIC_LABELS = {
 #   layer_norm  - layer-normalize the *observed* context too, so the whole
 #                 rollout lives in the predictor's output space. Consistent
 #                 across steps, but every token is then out-of-scale.
-FEEDBACK_MODES = ("rescale", "raw", "layer_norm")
+#   rescale_running
+#               - as `rescale`, but the mean/std are recomputed from the
+#                 *current* window at every step instead of being frozen at the
+#                 first real one. Uses no privileged information, and is exactly
+#                 equivalent to `rescale` for as long as the window still holds
+#                 real tokens. Past that point - after `context_tokens` steps,
+#                 which is 7 of 120 for a 16-frame/tubelet-2 model at 4 fps -
+#                 the statistics are derived entirely from previously rescaled
+#                 predictions, so any systematic offset in the predictor's
+#                 output scale compounds geometrically. Diagnostic: if it tracks
+#                 `rescale`, the frozen anchor is not doing any work.
+#   oracle_rescale
+#               - ORACLE, LEAKS THE FUTURE. Restores the per-token mean/std of
+#                 the *un-normalized target-encoder embedding of the frame being
+#                 predicted*, which is the exact algebraic inverse of the layer
+#                 norm the training loss applies. Not a legitimate rollout - a
+#                 world model cannot see the frame it is predicting - but an
+#                 upper bound: with a perfect predictor it reproduces the true
+#                 embedding exactly, so it degenerates to teacher forcing. Run it
+#                 to find out whether the feedback bridge is what limits the
+#                 horizon. If it tracks `rescale`, the bridge is not the
+#                 bottleneck and the report's conclusions are about the model.
+FEEDBACK_MODES = ("rescale", "raw", "layer_norm", "rescale_running", "oracle_rescale")
+
+# Modes that consume ground truth for the frame being predicted. Results from
+# these are diagnostic ceilings, never measurements, and every artifact they
+# produce says so.
+ORACLE_FEEDBACK_MODES = frozenset({"oracle_rescale"})
 
 # Horizons (seconds after the last observed frame) called out in the summary
 # tables. Models with different `fps`/`tubelet_size` advance by different
@@ -719,9 +746,46 @@ def temporal_slice(clip: torch.Tensor, first_token: int, num_tokens: int, tubele
     return clip[:, :, start : start + num_tokens * tubelet_size]
 
 
+# F.layer_norm's default. Kept explicit because `oracle_rescale` inverts the
+# normalization and has to use the same constant to be an exact inverse.
+LAYER_NORM_EPS = 1e-5
+
+
 def layer_norm_last(x: torch.Tensor) -> torch.Tensor:
     """The exact target normalization used by the pretraining loss."""
-    return F.layer_norm(x, (x.size(-1),))
+    return F.layer_norm(x, (x.size(-1),), eps=LAYER_NORM_EPS)
+
+
+def layer_norm_stats(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The per-token shift/scale that `layer_norm_last` divides out.
+
+    `F.layer_norm` with no affine is `y = (x - mu) / sqrt(var + eps)` over the
+    channel axis, so `x = y * sigma + mu` with these two is its *exact* inverse -
+    which is what makes a per-token scalar affine the right functional form for
+    every `rescale` variant, and what `oracle_rescale` uses to undo the
+    normalization exactly. Note the biased variance: that is what layer norm
+    uses, unlike `torch.std`'s unbiased default.
+
+    Returns two (..., ) tensors, one rank lower than `x`.
+    """
+    mean = x.mean(dim=-1)
+    sigma = (x.var(dim=-1, unbiased=False) + LAYER_NORM_EPS).sqrt()
+    return mean, sigma
+
+
+@dataclass
+class GroundTruth:
+    """Target-encoder embeddings of the frames a rollout has to predict.
+
+    `normalized` is what the predictions are *scored* against - the training
+    loss's target. `mean`/`sigma` are the per-token statistics layer norm
+    removed, kept only so `oracle_rescale` can put them back; nothing else may
+    read them, because doing so would leak the frame being predicted.
+    """
+
+    normalized: torch.Tensor  # (B, num_steps + 1, S, D), layer-normalized
+    mean: torch.Tensor  # (B, num_steps + 1, S), pre-normalization
+    sigma: torch.Tensor  # (B, num_steps + 1, S), pre-normalization
 
 
 @torch.no_grad()
@@ -730,7 +794,7 @@ def encode_ground_truth(
     geom: RolloutGeometry,
     clip: torch.Tensor,
     autocast_kwargs: dict,
-) -> torch.Tensor:
+) -> GroundTruth:
     """Layer-normalized target-encoder embedding of every frame the rollout has
     to predict, plus the last observed frame.
 
@@ -744,17 +808,23 @@ def encode_ground_truth(
                             (the persistence-baseline reference)
         w = k + 1        -> token N_t + k  = the frame predicted at step k
 
-    Returns (B, num_steps + 1, S, D); index 0 is the reference, index k+1 is the
-    ground truth for step k.
+    Index 0 is the reference, index k+1 is the ground truth for step k.
     """
-    outputs = []
+    normalized, means, sigmas = [], [], []
     for window in range(geom.num_steps + 1):
         frames = temporal_slice(clip, window, geom.window_tokens, geom.tubelet_size)
         with torch.autocast(**autocast_kwargs):
             tokens = bundle.target_encoder([frames])[0]
-        tokens = layer_norm_last(tokens.float())
-        outputs.append(tokens[:, -geom.spatial_tokens :])
-    return torch.stack(outputs, dim=1)
+        tokens = tokens.float()[:, -geom.spatial_tokens :]
+        mean, sigma = layer_norm_stats(tokens)
+        normalized.append(layer_norm_last(tokens))
+        means.append(mean)
+        sigmas.append(sigma)
+    return GroundTruth(
+        normalized=torch.stack(normalized, dim=1),
+        mean=torch.stack(means, dim=1),
+        sigma=torch.stack(sigmas, dim=1),
+    )
 
 
 @torch.no_grad()
@@ -832,12 +902,18 @@ def predict_next_token(
 
 
 def context_scale(context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-clip mean/std across channels of real context tokens.
+    """Per-clip mean/std across channels of context tokens, averaged over tokens.
 
     Predictions come out of `predictor_proj` in the layer-normalized target space
     (roughly zero-mean, unit-variance per token), whereas the predictor was fed
-    raw context-encoder tokens. These two statistics are what the `rescale`
-    feedback mode uses to put a prediction back on the context scale.
+    raw context-encoder tokens. These two statistics are what the `rescale` and
+    `rescale_running` feedback modes use to put a prediction back on the context
+    scale - the former from the first real window only, the latter from whatever
+    the window currently holds.
+
+    A single scalar pair per clip, because the scale of the *next* token is not
+    knowable; averaging the observed tokens is the estimate. `oracle_rescale`
+    replaces this estimate with the true per-token values.
     """
     tokens = context.float()
     mean = tokens.mean(dim=-1).mean(dim=-1)  # (B,)
@@ -845,11 +921,43 @@ def context_scale(context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return mean, std
 
 
+def feedback_scale(
+    mode: str,
+    context: torch.Tensor,
+    frozen: Tuple[torch.Tensor, torch.Tensor],
+    ground_truth: GroundTruth,
+    step: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The (mean, sigma) a rescaling mode feeds back with, broadcast to (B, *, 1).
+
+    Returns None for the modes that do not rescale. The three that do differ only
+    in where the two numbers come from:
+      rescale         - frozen at the first real context window
+      rescale_running - the current window, real or self-generated
+      oracle_rescale  - the true pre-normalization statistics of the frame being
+                        predicted. ORACLE: reads `ground_truth` at the step's own
+                        index, which is the future.
+    """
+    if mode == "rescale":
+        mean, std = frozen
+        return mean.view(-1, 1, 1), std.view(-1, 1, 1)
+    if mode == "rescale_running":
+        mean, std = context_scale(context)
+        return mean.view(-1, 1, 1), std.view(-1, 1, 1)
+    if mode == "oracle_rescale":
+        # Index step + 1: index 0 is the last *observed* frame, so this is the
+        # frame the model is being asked to predict and has not seen.
+        return (
+            ground_truth.mean[:, step + 1].unsqueeze(-1),
+            ground_truth.sigma[:, step + 1].unsqueeze(-1),
+        )
+    return None
+
+
 def apply_feedback(
     prediction: torch.Tensor,
     mode: str,
-    mean: torch.Tensor,
-    std: torch.Tensor,
+    scale: Optional[Tuple[torch.Tensor, torch.Tensor]],
     dtype: torch.dtype,
 ) -> torch.Tensor:
     if mode == "raw":
@@ -860,8 +968,11 @@ def apply_feedback(
         # approximately normalized, and letting that drift accumulate over a
         # hundred steps would defeat the point of this mode.
         out = layer_norm_last(prediction)
-    elif mode == "rescale":
-        out = prediction * std.view(-1, 1, 1) + mean.view(-1, 1, 1)
+    elif mode in ("rescale", "rescale_running", "oracle_rescale"):
+        if scale is None:
+            raise ValueError(f"feedback mode {mode!r} needs a scale but none was supplied")
+        mean, sigma = scale
+        out = prediction * sigma + mean
     else:
         raise ValueError(f"Unknown feedback mode: {mode}")
     return out.to(dtype)
@@ -906,12 +1017,16 @@ def rollout_clips(
             masks = None if geom.is_causal else masks_cache[batch_size]
 
             ground_truth = encode_ground_truth(bundle, geom, clip, autocast_kwargs)
-            reference = ground_truth[:, 0]  # last observed frame, in ground-truth space
+            reference = ground_truth.normalized[:, 0]  # last observed frame, in GT space
 
             # Observed context starts at temporal token 1: token 0 exists only so
             # the last observed frame has a full ground-truth window behind it.
             context = encode_context(bundle, geom, clip, 1, autocast_kwargs)
-            mean, std = context_scale(context)
+            # The frozen `rescale` anchor: computed once, from the only window
+            # that is entirely real. `rescale_running` recomputes per step
+            # instead; both still record this for comparison.
+            frozen_scale = context_scale(context)
+            mean, std = frozen_scale
             if feedback_mode == "layer_norm":
                 context = layer_norm_last(context.float()).to(context.dtype)
 
@@ -923,7 +1038,7 @@ def rollout_clips(
                 prediction = predict_next_token(
                     bundle, geom, context, masks, mask_token_index, autocast_kwargs
                 )
-                target = ground_truth[:, step + 1]
+                target = ground_truth.normalized[:, step + 1]
 
                 pred_dist = frame_distances(prediction, target)
                 ref_dist = frame_distances(reference, target)
@@ -942,6 +1057,40 @@ def rollout_clips(
                         (batch_size,), float("nan"), device=prediction.device
                     )
 
+                # Layer-norm scale of the prediction: std *across channels*, per
+                # token - the same reduction `context_scale` applies to real
+                # context tokens, and a different quantity from the spatial std
+                # above (which is spread across patches). The predictor is
+                # trained to emit layer-normalized targets, so this should sit
+                # at 1.0.
+                #
+                # Two things depend on it. It is a collapse signal in its own
+                # right - drifting toward 0 means the prediction is flattening
+                # toward a constant token. And it decides whether the frozen
+                # `rescale` anchor matters: `mean`/`std` are computed once from
+                # the first real context window, and the alternative of
+                # recomputing them from the current window each step is only
+                # equivalent if this value is 1.0. The real context is fully
+                # evicted after `context_tokens` steps (7 of 120 for a
+                # 16-frame/tubelet-2 model at 4 fps), so past that point a
+                # recomputed anchor would compound any offset geometrically,
+                # while the frozen one re-applies a constant and cannot drift.
+                pred_token_std = prediction.std(dim=-1).mean(dim=-1)
+
+                # The scale actually fed back this step. Constant for `rescale`,
+                # a trajectory for `rescale_running` (this is the quantity that
+                # compounds once the real context is evicted) and the true
+                # per-token value for `oracle_rescale`. Recorded so the three can
+                # be compared directly instead of inferred.
+                scale = feedback_scale(feedback_mode, context, frozen_scale, ground_truth, step)
+                if scale is None:
+                    feedback_mean = feedback_std = torch.full(
+                        (batch_size,), float("nan"), device=prediction.device
+                    )
+                else:
+                    feedback_mean = scale[0].reshape(batch_size, -1).mean(dim=1)
+                    feedback_std = scale[1].reshape(batch_size, -1).mean(dim=1)
+
                 for i in range(batch_size):
                     row = {
                         "model": model_name,
@@ -952,6 +1101,14 @@ def rollout_clips(
                         "lead_seconds": geom.lead_seconds(step),
                         "pred_spatial_std": float(pred_spatial_std[i]),
                         "gt_spatial_std": float(gt_spatial_std[i]),
+                        "pred_token_std": float(pred_token_std[i]),
+                        # Constant across steps (the frozen anchor), recorded per
+                        # row so the recomputed-anchor trajectory can be simulated
+                        # offline as sigma_{k+1} = mean(sigma_j * s_j) without a
+                        # second GPU run.
+                        "context_token_std": float(std[i]),
+                        "feedback_std": float(feedback_std[i]),
+                        "feedback_mean": float(feedback_mean[i]),
                     }
                     for metric in METRICS:
                         row[f"{metric}_pred"] = float(pred_dist[metric][i])
@@ -964,7 +1121,7 @@ def rollout_clips(
                 context = torch.cat(
                     [
                         context[:, geom.spatial_tokens :],
-                        apply_feedback(prediction, feedback_mode, mean, std, context.dtype),
+                        apply_feedback(prediction, feedback_mode, scale, context.dtype),
                     ],
                     dim=1,
                 )
@@ -1005,7 +1162,7 @@ def add_teacher_forced_metrics(
     bundle: ModelBundle,
     geom: RolloutGeometry,
     clip: torch.Tensor,
-    ground_truth: torch.Tensor,
+    ground_truth: GroundTruth,
     rows: List[dict],
     masks: Optional[Tuple[torch.Tensor, torch.Tensor]],
     mask_token_index: int,
@@ -1029,7 +1186,7 @@ def add_teacher_forced_metrics(
         if feedback_mode == "layer_norm":
             context = layer_norm_last(context.float()).to(context.dtype)
         prediction = predict_next_token(bundle, geom, context, masks, mask_token_index, autocast_kwargs)
-        target = ground_truth[:, step + 1]
+        target = ground_truth.normalized[:, step + 1]
         distances = frame_distances(prediction, target)
 
         step_rows = sorted(by_step.get(step, []), key=lambda r: r["clip_id"])
@@ -1105,6 +1262,10 @@ def per_step_frame(df: pd.DataFrame, result: RolloutResult, geom: RolloutGeometr
             aggregations[f"{metric}_tf"] = (f"{metric}_tf", "mean")
             aggregations[f"{metric}_tf_norm"] = (f"{metric}_tf_norm", "mean")
     aggregations["spatial_std_ratio"] = ("spatial_std_ratio", "mean")
+    aggregations["pred_token_std"] = ("pred_token_std", "mean")
+    aggregations["context_token_std"] = ("context_token_std", "mean")
+    aggregations["feedback_std"] = ("feedback_std", "mean")
+    aggregations["feedback_mean"] = ("feedback_mean", "mean")
 
     frame = df.groupby("step", as_index=False).agg(**aggregations).sort_values("step").reset_index(drop=True)
 
@@ -1307,9 +1468,11 @@ def per_step_table(step_frame: pd.DataFrame, primary: str) -> List[str]:
     header = (
         "| Step | Lead (s) | Rollout | Persistence | **Normalized** | "
         + ("Teacher-forced | TF normalized | " if has_tf else "")
-        + "Spatial detail | Cross-clip |"
+        + "Spatial detail | Cross-clip | Token std |"
     )
-    divider = "| --- | --- | --- | --- | --- | " + ("--- | --- | " if has_tf else "") + "--- | --- |"
+    divider = (
+        "| --- | --- | --- | --- | --- | " + ("--- | --- | " if has_tf else "") + "--- | --- | --- |"
+    )
     lines = [header, divider]
     for row in step_frame.itertuples():
         cells = [
@@ -1324,6 +1487,7 @@ def per_step_table(step_frame: pd.DataFrame, primary: str) -> List[str]:
             cells.append(fmt(getattr(row, f"{primary}_tf_norm")))
         cells.append(fmt(getattr(row, "spatial_std_ratio", np.nan)))
         cells.append(fmt(getattr(row, "dispersion_ratio", np.nan)))
+        cells.append(fmt(getattr(row, "pred_token_std", np.nan)))
         lines.append("| " + " | ".join(cells) + " |")
     return lines
 
@@ -1348,6 +1512,16 @@ def generate_markdown_report(
 
     lines.append("# Autoregressive World-Model Report")
     lines.append("")
+    if args.feedback in ORACLE_FEEDBACK_MODES:
+        lines.append(
+            f"> **⚠ ORACLE RUN - NOT A MEASUREMENT.** This report was generated with "
+            f"`--feedback {args.feedback}`, which rescales every prediction using the true "
+            "pre-normalization statistics of *the frame being predicted*. The rollout therefore sees "
+            "the future it is scored against, and every number below is a **diagnostic ceiling**. Its "
+            "only legitimate use is comparison against a `rescale` run: if the two agree, the feedback "
+            "bridge is not what limits the horizon. Do not quote these figures as model performance."
+        )
+        lines.append("")
     lines.append(
         f"How long can each model keep predicting its own representation of a video before the "
         f"prediction stops telling us anything about what actually happens? Every model is rolled "
@@ -1416,6 +1590,29 @@ def generate_markdown_report(
                 + "; ".join(collapse_notes)
                 + ". A value near 0 means the prediction has become the same vector regardless of input, "
                 "which would make the raw distances above meaningless on their own."
+            )
+        token_std_notes = []
+        for name in ranked:
+            meta = model_meta[name]
+            first = meta.get("first_pred_token_std", np.nan)
+            last = meta.get("last_pred_token_std", np.nan)
+            if not np.isfinite(first) or not np.isfinite(last):
+                continue
+            token_std_notes.append(
+                f"**{name}** {fmt(first, 4)} at step 1 -> {fmt(last, 4)} at step "
+                f"{meta['geometry'].num_steps}"
+            )
+        if token_std_notes:
+            lines.append(
+                "- Predictor output scale (std across channels per token): "
+                + "; ".join(token_std_notes)
+                + ". The predictor is trained to emit layer-normalized targets, so **1.0 is the "
+                "expected value**. Drift toward 0 is the prediction flattening into a constant token. "
+                "It also decides whether the frozen `rescale` anchor is a live choice: the anchor is "
+                "computed once from the first real context window, and recomputing it from the current "
+                "window each step would be equivalent *only* if this stays at 1.0 - the real context is "
+                f"evicted after {model_meta[ranked[0]]['geometry'].context_tokens} step(s), past which a "
+                "recomputed anchor compounds any offset geometrically while a frozen one cannot."
             )
         lines.append("")
 
@@ -1496,7 +1693,9 @@ def generate_markdown_report(
         lines.append("")
         lines.append(
             "The full degradation curve, one row per autoregressive step, averaged over clips. "
-            "`Spatial detail` and `Cross-clip` are the two collapse ratios described above."
+            "`Spatial detail` and `Cross-clip` are the two collapse ratios described above. "
+            "`Token std` is the std across channels of a predicted token, which should be 1.0 for a "
+            "predictor emitting layer-normalized targets."
         )
         lines.append("")
         for name in ranked:
@@ -1562,11 +1761,39 @@ def generate_markdown_report(
     lines.append(
         f"5. **Prediction feedback: `{args.feedback}`.** The predictor is trained to *output* "
         "layer-normalized target features but to *consume* raw context-encoder features, so an "
-        "autoregressive rollout has to bridge the two spaces. `rescale` (the default) puts each "
-        "prediction back on the per-token scale of the real context tokens, keeping the predictor's "
-        "*input* distribution correct. `raw` feeds predictions back untouched; `layer_norm` instead "
-        "moves the whole rollout into the predictor's output space. Re-run with `--feedback` to check "
-        "that a conclusion does not hinge on this choice."
+        "autoregressive rollout has to bridge the two spaces. Layer norm without an affine is "
+        "`y = (x - mu) / sigma` over channels, so its exact inverse is a *per-token scalar affine* - "
+        "which means every `rescale` variant has the right functional form and differs only in where "
+        "it gets `mu` and `sigma`:"
+    )
+    lines.append("")
+    lines.append(
+        "   - `rescale` (default) - the average per-token `mu`/`sigma` of the **first real context "
+        "window**, frozen for the whole rollout. Keeps the predictor's *input* distribution correct "
+        "and cannot drift, because the same constant is re-applied every step."
+    )
+    lines.append(
+        "   - `rescale_running` - the same statistics, but recomputed from the **current window** at "
+        "every step. Leak-free, and identical to `rescale` while the window still holds real tokens. "
+        "Past that - the real context is fully evicted after `context_tokens` steps - the statistics "
+        "come entirely from previously rescaled predictions, so any systematic offset in the "
+        "predictor's output scale compounds geometrically. The `Token std` column is what decides "
+        "whether that matters: at exactly 1.0 the two modes coincide."
+    )
+    lines.append(
+        "   - `oracle_rescale` - **sees the future.** Uses the true per-token `mu`/`sigma` of the "
+        "un-normalized target-encoder embedding of the frame being predicted, i.e. the exact inverse "
+        "of the training loss's layer norm. With a perfect predictor this reproduces the real "
+        "embedding and the rollout degenerates to teacher forcing, which is what makes it an upper "
+        "bound rather than a measurement."
+    )
+    lines.append(
+        "   - `raw` - predictions fed back untouched. `layer_norm` - the *observed* context is "
+        "normalized too, moving the whole rollout into the predictor's output space."
+    )
+    lines.append("")
+    lines.append(
+        "   Re-run with `--feedback` to check that a conclusion does not hinge on this choice."
     )
     lines.append("")
 
@@ -1684,8 +1911,12 @@ def generate_markdown_report(
     lines.append(
         "- **The feedback bridge is a real assumption.** No rollout of a JEPA predictor can be exactly "
         "faithful, because the predictor's output space (layer-normalized target features) is not its "
-        "input space (raw context features). `--feedback` exposes the three reasonable choices; "
-        "conclusions that flip between them are conclusions about the bridge, not about the model."
+        "input space (raw context features). `--feedback` exposes the reasonable choices; conclusions "
+        "that flip between them are conclusions about the bridge, not about the model. The bridge can "
+        "be bounded rather than argued about: `--feedback oracle_rescale` supplies the exact scale of "
+        "the frame being predicted (an oracle - it reads the future), so the gap between it and "
+        "`rescale` is the entire cost of not knowing that scale. If the gap is small, the bridge is "
+        "not the bottleneck and these numbers are about the model."
     )
     lines.append(
         "- **Only the first step is free of drift.** Every later step conditions on the model's own "
@@ -1776,9 +2007,13 @@ def parse_args() -> argparse.Namespace:
         choices=FEEDBACK_MODES,
         default="rescale",
         help=(
-            "How a prediction is mapped back into the predictor's input space. `rescale` restores the "
-            "scale of real context tokens, `raw` feeds predictions untouched, `layer_norm` moves the "
-            "whole rollout into the predictor's output space."
+            "How a prediction is mapped back into the predictor's input space. `rescale` (default) "
+            "restores the scale of the first real context window, `raw` feeds predictions untouched, "
+            "`layer_norm` moves the whole rollout into the predictor's output space, `rescale_running` "
+            "recomputes the scale from the current window every step (leak-free; diverges from "
+            "`rescale` only once the real context has been evicted). `oracle_rescale` restores the true "
+            "per-token scale of the frame being predicted - it SEES THE FUTURE and is a diagnostic "
+            "ceiling, not a measurement; use it to test whether the bridge is what limits the horizon."
         ),
     )
     parser.add_argument(
@@ -1834,6 +2069,20 @@ def main() -> None:
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     logger.info("Using device: %s", device)
+    logger.info("Feedback mode: %s", args.feedback)
+    if args.feedback in ORACLE_FEEDBACK_MODES:
+        logger.warning(
+            "ORACLE RUN: --feedback %s rescales each prediction with the true statistics of the frame "
+            "being predicted, so the rollout sees the future it is scored against. Results are a "
+            "diagnostic ceiling to compare against a `rescale` run, not model performance.",
+            args.feedback,
+        )
+    if args.feedback == "rescale_running":
+        logger.info(
+            "rescale_running: the feedback scale is recomputed from the current window each step, so "
+            "it is identical to `rescale` until the real context is evicted and self-referential "
+            "afterwards. Watch the `feedback_std` column for geometric drift."
+        )
 
     all_rows: List[dict] = []
     model_meta: Dict[str, dict] = {}
@@ -2003,6 +2252,7 @@ def main() -> None:
                     "horizon_seconds": geom.horizon_seconds,
                     "is_causal": geom.is_causal,
                     "feedback": args.feedback,
+                    "feedback_is_oracle": args.feedback in ORACLE_FEEDBACK_MODES,
                     "checkpoint": checkpoint_path,
                 },
                 indent=2,
@@ -2024,6 +2274,11 @@ def main() -> None:
                 if "dispersion_ratio" in frame.columns
                 else float("nan"),
                 "mean_spatial_ratio": float(frame["spatial_std_ratio"].mean()),
+                "mean_pred_token_std": float(frame["pred_token_std"].mean()),
+                "first_pred_token_std": float(frame.iloc[0]["pred_token_std"]),
+                "last_pred_token_std": float(frame.iloc[-1]["pred_token_std"]),
+                "first_feedback_std": float(frame.iloc[0]["feedback_std"]),
+                "last_feedback_std": float(frame.iloc[-1]["feedback_std"]),
                 "horizon_rows": horizon_rows(frame, geom, primary),
             }
         )
@@ -2039,6 +2294,26 @@ def main() -> None:
             model_meta[model_name]["first_step_norm"],
             geom.num_steps,
             model_meta[model_name]["mean_dispersion_ratio"],
+        )
+        logger.info(
+            "%s: predictor output scale (std across channels, 1.0 = exactly layer-normalized) "
+            "%.4f at step 1 -> %.4f at step %d, mean %.4f. The real context is evicted after %d "
+            "step(s), so a per-step-recomputed rescale anchor would compound this offset from there on; "
+            "the frozen anchor does not.",
+            model_name,
+            model_meta[model_name]["first_pred_token_std"],
+            model_meta[model_name]["last_pred_token_std"],
+            geom.num_steps,
+            model_meta[model_name]["mean_pred_token_std"],
+            geom.context_tokens,
+        )
+        logger.info(
+            "%s: feedback scale (%s) %.4f at step 1 -> %.4f at step %d",
+            model_name,
+            args.feedback,
+            model_meta[model_name]["first_feedback_std"],
+            model_meta[model_name]["last_feedback_std"],
+            geom.num_steps,
         )
 
     steps_df = pd.DataFrame(all_rows)
