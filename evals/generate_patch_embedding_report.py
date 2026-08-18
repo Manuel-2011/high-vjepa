@@ -54,36 +54,36 @@ logger = logging.getLogger(__name__)
 DEFAULT_NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
 MODELS_CONFIG = [
-    {
-        "name": "V-JEPA2 (original pre-trained checkpoint)",
-        "checkpoint": "models/vitl.pt",
-        "config": "configs/train/vitl16-EK100/pretrain-vjepa.yaml",
-    },
+    # {
+    #     "name": "V-JEPA2 (original pre-trained checkpoint)",
+    #     "checkpoint": "models/vitl.pt",
+    #     "config": "configs/train/vitl16-EK100/pretrain-vjepa.yaml",
+    # },
     {
         "name": "V-JEPA2 (baseline)",
         "checkpoint": "preliminary_experiments/EK100-vjepa-16f-4pfs/latest.pt",
         "config": "configs/train/vitl16-EK100/pretrain-vjepa.yaml",
     },
-    {
-        "name": "High V-JEPA (Same data as baseline)",
-        "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f_extended/latest.pt",
-        "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_extended.yaml",
-    },
-    {
-        "name": "High V-JEPA (Same data + patches)",
-        "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f-16x16/latest.pt",
-        "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_extended_16x16.yaml",
-    },
-    {
-        "name": "V-JEPA2 - Causal learning",
-        "checkpoint": "preliminary_experiments/EK100-vjepa-16f-4pfs-future-prediction/latest.pt",
-        "config": "configs/train/vitl16-EK100/pretrain-vjepa-future-prediction-task.yaml",
-    },
-    {
-        "name": "High V-JEPA on V-JEPA2",
-        "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f-16x16_post_training/latest.pt",
-        "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_16x16_post_training.yaml",
-    },
+    # {
+    #     "name": "High V-JEPA (Same data as baseline)",
+    #     "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f_extended/latest.pt",
+    #     "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_extended.yaml",
+    # },
+    # {
+    #     "name": "High V-JEPA (Same data + patches)",
+    #     "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f-16x16/latest.pt",
+    #     "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_extended_16x16.yaml",
+    # },
+    # {
+    #     "name": "V-JEPA2 - Causal learning",
+    #     "checkpoint": "preliminary_experiments/EK100-vjepa-16f-4pfs-future-prediction/latest.pt",
+    #     "config": "configs/train/vitl16-EK100/pretrain-vjepa-future-prediction-task.yaml",
+    # },
+    # {
+    #     "name": "High V-JEPA on V-JEPA2",
+    #     "checkpoint": "preliminary_experiments/EK100-long-vjepa-16f-16x16_post_training/latest.pt",
+    #     "config": "configs/train/vitl16-EK100/pretrain-long-vjepa_16x16_post_training.yaml",
+    # },
 ]
 
 

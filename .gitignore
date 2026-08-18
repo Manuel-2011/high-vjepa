@@ -34,4 +34,10 @@ configs/local
 ss2_dataset/
 data/
 preliminary_experiments/*/*
-models/
+# Anchored to the repo root: this is the top-level checkpoint directory
+# (vitl.pt, vitg-384.pt, ...). Unanchored, `models/` also matched src/models/,
+# tests/models/ and app/vjepa_2_1/models/, silently hiding every NEW file added
+# under them - already-tracked files were unaffected, so the trap only fired on
+# new work.
+/models/
+.env

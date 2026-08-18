@@ -1,0 +1,88 @@
+# Config B: direct masked cross-attention.
+#
+# The DiT cross-attends straight to the adapted latent tokens, with a padding
+# mask over the variable length. No resampler and no bottleneck, so the decoder
+# can reach every token the world model emitted - which makes this the reference
+# against which Config A's summary is judged. The cost is that attention now
+# scales with L, so a 1024-token model is genuinely more expensive here than a
+# 256-token one; when comparing across models under Config B, remember that the
+# compute budget is no longer matched even though the parameter count is.
+#
+# The SAME file trains a decoder for ANY world model. Only the shard set changes:
+#
+#   python -m app.flow_decoder.train --config configs/train/flow_decoder/configB-direct.yaml \
+#       --override data.train_shards=data/flow_decoder_shards/<model>/train \
+#       --override data.eval_shards=data/flow_decoder_shards/<model>/eval \
+#       --override folder=preliminary_experiments/flow-decoder/<model>-configB
+#
+# d_m, the token grid and the normalization buffers are read from the shard
+# manifest. Nothing else may differ between world models - that is a spec
+# prohibition, and evals/generate_flow_decoder_panels.py enforces it by comparing
+# the saved model_config of every checkpoint it loads.
+app: flow_decoder
+folder: preliminary_experiments/flow-decoder/vjepa2-baseline-configB
+
+data:
+  train_shards: data/flow_decoder_shards/vjepa2-baseline/train
+  eval_shards: data/flow_decoder_shards/vjepa2-baseline/eval
+  # target_encoder = the world model's representation of the real next frame,
+  # i.e. its latent space. `predictor` decodes the world model's own prediction
+  # instead; both are cached, and which one is decoded is a global choice.
+  latent_source: target_encoder
+  batch_size: 8
+  num_workers: 4
+
+codec:
+  # Frozen. Never trained or fine-tuned (spec prohibition).
+  kind: kl
+  model_id: stabilityai/sd-vae-ft-mse
+  downsample_factor: 8
+
+model:
+  conditioning: direct
+  patch_size: 2
+  dim: 768
+  depth: 12
+  num_heads: 12
+  cond_dim: 768
+  mlp_ratio: 4.0
+  # Unused under `direct` conditioning; kept so the two configs stay diffable.
+  num_queries: 128
+  resampler_depth: 2
+  resampler_heads: 8
+  latent_norm_mode: channel
+  num_coord_bands: 8
+  use_activation_checkpointing: true
+
+flow:
+  timestep_mode: logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+  latent_dropout: 0.1
+  sigma_max: 0.5
+  sigma_prob: 0.5
+
+optimization:
+  # FIXED budget, shared by every run in a comparison. Do not shorten one run
+  # because its eval loss flattened - there is no early stopping.
+  steps: 60000
+  grad_accum: 2
+  lr: 0.0001
+  start_lr: 0.000001
+  final_lr: 0.00001
+  warmup: 1000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  clip_grad: 1.0
+  ema_decay: 0.9999
+
+meta:
+  seed: 0
+  dtype: bfloat16
+  log_freq: 100
+  eval_freq: 2000
+  eval_batches: 16
+  save_freq: 2000
+  sample_freq: 5000
+  sample_steps: 24
+  sample_guidance: 1.5
