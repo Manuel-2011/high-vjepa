@@ -25,3 +25,10 @@ ftfy
 jupyter
 scikit-learn
 umap-learn
+
+# --- flow-matching decoder (src/models/flow_decoder, app/flow_decoder) ---
+# Frozen KL VAE for the decoder's latent space. Optional: --codec patchify runs
+# the whole pipeline weight-free and needs no download.
+diffusers
+# Blinded 2AFC app only (app/flow_decoder/app_2afc.py). Nothing else needs it.
+gradio
