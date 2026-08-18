@@ -35,3 +35,4 @@ ss2_dataset/
 data/
 preliminary_experiments/*/*
 models/
+.env
