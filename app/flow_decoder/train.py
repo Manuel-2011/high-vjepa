@@ -169,6 +169,7 @@ def build_decoder(config: dict, info, codec, device: str) -> FlowMatchingDecoder
         cond_dim=int(model_cfg.get("cond_dim", 768)),
         mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
         conditioning=str(model_cfg.get("conditioning", "perceiver")),
+        frame_conditioning=str(model_cfg.get("frame_conditioning", "none")),
         num_queries=int(model_cfg.get("num_queries", 128)),
         resampler_depth=int(model_cfg.get("resampler_depth", 2)),
         resampler_heads=int(model_cfg.get("resampler_heads", 8)),
@@ -225,9 +226,9 @@ def evaluate(
             break
         generator = torch.Generator(device=device)
         generator.manual_seed(1234 + counted)
-        target, cond, z = prepare_batch(batch, codec, device)
+        target, cond, z = prepare_batch(batch, codec, device, flow.decoder.uses_frame_conditioning)
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            _, metrics = flow.loss(target, cond, z, coords=coords, generator=generator)
+            _, metrics = flow.loss(target, z, cond_latent=cond, coords=coords, generator=generator)
         for key, value in metrics.items():
             if value == value:  # skip NaN (an all-conditional or all-dropped batch)
                 totals[key] = totals.get(key, 0.0) + value
@@ -236,12 +237,22 @@ def evaluate(
     return {k: v / max(1, counted) for k, v in totals.items()}
 
 
-def prepare_batch(batch: dict, codec, device: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """uint8 frames -> frozen codec latents, on the GPU. Returns (target, cond, z)."""
-    prev = frames_to_unit(batch["frame_prev"].to(device, non_blocking=True))
+def prepare_batch(
+    batch: dict, codec, device: str, needs_frame: bool
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """uint8 frames -> frozen codec latents, on the GPU. Returns (target, cond, z).
+
+    `cond` is None unless the decoder was built with
+    `frame_conditioning='current_frame'`; under the default `none` the preceding
+    frame is never encoded at all, which is both a saved VAE pass per step and a
+    hard guarantee that it cannot leak into the reconstruction.
+    """
     nxt = frames_to_unit(batch["frame_next"].to(device, non_blocking=True))
     target = codec.encode(nxt).float()
-    cond = codec.encode(prev).float()
+    cond = None
+    if needs_frame:
+        prev = frames_to_unit(batch["frame_prev"].to(device, non_blocking=True))
+        cond = codec.encode(prev).float()
     return target, cond, batch["z"].to(device, non_blocking=True).float()
 
 
@@ -427,6 +438,17 @@ def main() -> None:
         batch_size,
         accum,
     )
+    if decoder.uses_frame_conditioning:
+        logger.info(
+            "frame_conditioning=current_frame: the decoder also sees the preceding frame, so a sample "
+            "can look plausible without reading the latent. Check panel 6's latent-swap control before "
+            "reading anything else."
+        )
+    else:
+        logger.info(
+            "frame_conditioning=none: reconstruction from the latent alone. Expect markedly blurrier "
+            "samples than the frame-conditioned variant - that is the measurement, not a defect."
+        )
 
     train_iter = iter(train_loader)
     decoder.train()
@@ -439,9 +461,9 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         for micro in range(accum):
             batch = next(train_iter)
-            target, cond, z = prepare_batch(batch, codec, device)
+            target, cond, z = prepare_batch(batch, codec, device, decoder.uses_frame_conditioning)
             with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-                loss, metrics = flow.loss(target, cond, z, coords=coords)
+                loss, metrics = flow.loss(target, z, cond_latent=cond, coords=coords)
             scaler.scale(loss / accum).backward()
             for key, value in metrics.items():
                 if value == value:
@@ -531,6 +553,7 @@ def dump_samples(
     prev = frames_to_unit(torch.stack([it["frame_prev"] for it in items]).to(device))
     nxt = frames_to_unit(torch.stack([it["frame_next"] for it in items]).to(device))
     z = torch.stack([it["z"] for it in items]).float().to(device)
+    cond = codec.encode(prev).float() if decoder.uses_frame_conditioning else None
 
     shadow = copy.deepcopy(decoder.state_dict())
     ema.copy_to(decoder)
@@ -538,8 +561,8 @@ def dump_samples(
     try:
         latent = sample_ode(
             decoder,
-            cond_latent=codec.encode(prev).float(),
             z=z,
+            cond_latent=cond,
             coords=coords,
             num_steps=int(config.get("meta", {}).get("sample_steps", 24)),
             guidance=float(config.get("meta", {}).get("sample_guidance", 1.5)),
@@ -551,6 +574,7 @@ def dump_samples(
         decoder.load_state_dict(shadow)
         decoder.train()
 
+    # Rows: preceding frame (context only under `none`), reconstruction, truth.
     grid = torch.cat([prev.cpu(), recon.float().cpu(), nxt.cpu()], dim=0)
     out = folder / "samples"
     out.mkdir(exist_ok=True)

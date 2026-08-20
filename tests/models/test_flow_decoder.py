@@ -38,7 +38,7 @@ CODEC_CHANNELS = 4
 CODEC_SIZE = 16
 
 
-def make_decoder(latent_dim=64, grid=(1, 8, 8), conditioning="perceiver", **kwargs):
+def make_decoder(latent_dim=64, grid=(1, 8, 8), conditioning="perceiver", frame_conditioning="none", **kwargs):
     return FlowMatchingDecoder(
         latent_dim=latent_dim,
         latent_grid=grid,
@@ -50,6 +50,7 @@ def make_decoder(latent_dim=64, grid=(1, 8, 8), conditioning="perceiver", **kwar
         num_heads=4,
         cond_dim=48,
         conditioning=conditioning,
+        frame_conditioning=frame_conditioning,
         num_queries=16,
         resampler_depth=1,
         resampler_heads=4,
@@ -76,14 +77,16 @@ def perturb_zero_init(decoder, std=0.02):
     return decoder
 
 
-def make_inputs(batch=2, length=64, latent_dim=64, grid=(1, 8, 8)):
-    return {
+def make_inputs(batch=2, length=64, latent_dim=64, grid=(1, 8, 8), with_frame=False):
+    inputs = {
         "x_tau": torch.randn(batch, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
         "tau": torch.rand(batch),
-        "cond_latent": torch.randn(batch, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
         "z": torch.randn(batch, length, latent_dim),
         "coords": build_token_coords(grid),
     }
+    if with_frame:
+        inputs["cond_latent"] = torch.randn(batch, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE)
+    return inputs
 
 
 class TestCoordinateEncoding(unittest.TestCase):
@@ -223,11 +226,15 @@ class TestLatentDropout(unittest.TestCase):
             b = decoder(**other)
         self.assertGreater((a - b).abs().max().item(), 1e-6)
 
-    def test_x_t_is_never_dropped(self):
-        """The unconditional branch must still see the current frame."""
+    def test_x_t_is_never_dropped_when_present(self):
+        """Under `current_frame`, the unconditional branch must still see x_t.
+
+        That is what makes w = 0 a *persistence* prior in that mode rather than a
+        generic sample, and hence what the guidance ladder measures against.
+        """
         torch.manual_seed(0)
-        decoder = perturb_zero_init(make_decoder().eval())
-        inputs = make_inputs(batch=1)
+        decoder = perturb_zero_init(make_decoder(frame_conditioning="current_frame").eval())
+        inputs = make_inputs(batch=1, with_frame=True)
         drop = torch.ones(1, dtype=torch.bool)
         with torch.no_grad():
             a = decoder(**inputs, drop_latent=drop)
@@ -235,6 +242,90 @@ class TestLatentDropout(unittest.TestCase):
             other["cond_latent"] = torch.randn_like(inputs["cond_latent"])
             b = decoder(**other, drop_latent=drop)
         self.assertGreater((a - b).abs().max().item(), 1e-6)
+
+
+class TestLatentOnlyReconstruction(unittest.TestCase):
+    """The default mode: reconstruct from the world model's tokens and nothing else."""
+
+    def test_default_mode_is_latent_only(self):
+        decoder = make_decoder()
+        self.assertEqual(decoder.frame_conditioning, "none")
+        self.assertFalse(decoder.uses_frame_conditioning)
+
+    def test_patchify_takes_only_the_target_channels(self):
+        """No second channel block means there is physically nowhere for a frame
+        to enter - the guarantee is structural, not a convention."""
+        self.assertEqual(make_decoder().patchify_channels, CODEC_CHANNELS)
+        self.assertEqual(
+            make_decoder(frame_conditioning="current_frame").patchify_channels, 2 * CODEC_CHANNELS
+        )
+
+    def test_supplying_a_frame_is_an_error(self):
+        """Silently ignoring it would make every panel unreadable."""
+        decoder = make_decoder()
+        with self.assertRaises(ValueError):
+            decoder(**make_inputs(batch=1, with_frame=True))
+
+    def test_frame_conditioned_mode_requires_a_frame(self):
+        decoder = make_decoder(frame_conditioning="current_frame")
+        with self.assertRaises(ValueError):
+            decoder(**make_inputs(batch=1, with_frame=False))
+
+    def test_rejects_an_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            make_decoder(frame_conditioning="previous_clip")
+
+    def test_output_depends_only_on_the_latent(self):
+        """Same seed, different latent -> different image; and nothing else to vary."""
+        torch.manual_seed(0)
+        decoder = perturb_zero_init(make_decoder().eval())
+        inputs = make_inputs(batch=1)
+        with torch.no_grad():
+            a = decoder(**inputs)
+            other = dict(inputs)
+            other["z"] = torch.randn_like(inputs["z"])
+            b = decoder(**other)
+        self.assertGreater((a - b).abs().max().item(), 1e-6)
+
+    def test_the_two_modes_are_not_checkpoint_compatible(self):
+        """A mode mismatch must fail loudly rather than load a wrong-shaped conv."""
+        latent_only = make_decoder()
+        framed = make_decoder(frame_conditioning="current_frame")
+        with self.assertRaises(RuntimeError):
+            latent_only.load_state_dict(framed.state_dict())
+
+    def test_sampler_needs_no_conditioning_image(self):
+        """`latent_shape` supplies what cond_latent used to: there is no image to
+        read an output shape off in this mode."""
+        torch.manual_seed(0)
+        decoder = perturb_zero_init(make_decoder().eval())
+        z = torch.randn(2, 64, 64)
+        out = sample_ode(decoder, z, coords=build_token_coords((1, 8, 8)), num_steps=3, seed=0)
+        self.assertEqual(out.shape, (2, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE))
+        self.assertEqual(decoder.latent_shape(2), (2, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE))
+
+    def test_guidance_still_works_without_a_frame(self):
+        """CFG only ever drops z, so it is well-defined in this mode too - but the
+        unconditional branch is now a generic-frame prior, not persistence."""
+        torch.manual_seed(0)
+        decoder = perturb_zero_init(make_decoder().eval())
+        z = torch.randn(2, 64, 64)
+        coords = build_token_coords((1, 8, 8))
+        a = sample_ode(decoder, z, coords=coords, num_steps=3, guidance=1.0, seed=1)
+        b = sample_ode(decoder, z, coords=coords, num_steps=3, guidance=4.0, seed=1)
+        self.assertGreater((a - b).abs().max().item(), 1e-6)
+
+    def test_loss_runs_without_a_conditioning_latent(self):
+        decoder = make_decoder()
+        flow = RectifiedFlow(decoder, FlowConfig(latent_dropout=0.5))
+        loss, metrics = flow.loss(
+            torch.randn(4, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
+            torch.randn(4, 64, 64),
+            coords=build_token_coords((1, 8, 8)),
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("loss", metrics)
 
 
 class TestNormalization(unittest.TestCase):
@@ -276,9 +367,9 @@ class TestFlowObjective(unittest.TestCase):
         decoder = make_decoder()
         flow = RectifiedFlow(decoder, FlowConfig(latent_dropout=0.0, sigma_max=0.0))
         target = torch.randn(64, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE)
-        cond = torch.randn_like(target)
+        cond = None
         z = torch.randn(64, 64, 64)
-        loss, metrics = flow.loss(target, cond, z, coords=build_token_coords((1, 8, 8)))
+        loss, metrics = flow.loss(target, z, cond_latent=cond, coords=build_token_coords((1, 8, 8)))
         self.assertAlmostEqual(loss.item(), 2.0, delta=0.15)
         self.assertAlmostEqual(metrics["target_std"], 1.0, delta=0.05)
 
@@ -295,7 +386,6 @@ class TestFlowObjective(unittest.TestCase):
         for dropout in (0.0, 1.0):
             flow = RectifiedFlow(decoder, FlowConfig(latent_dropout=dropout))
             loss, _ = flow.loss(
-                torch.randn(4, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
                 torch.randn(4, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
                 torch.randn(4, 64, 64),
                 coords=build_token_coords((1, 8, 8)),
@@ -314,7 +404,6 @@ class TestFlowObjective(unittest.TestCase):
         decoder = make_decoder()
         flow = RectifiedFlow(decoder, FlowConfig(latent_dropout=0.0))
         loss, _ = flow.loss(
-            torch.randn(4, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
             torch.randn(4, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE),
             torch.randn(4, 64, 64),
             coords=build_token_coords((1, 8, 8)),
@@ -346,37 +435,36 @@ class TestSampler(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
         self.decoder = perturb_zero_init(make_decoder().eval())
-        self.cond = torch.randn(2, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE)
         self.z = torch.randn(2, 64, 64)
         self.coords = build_token_coords((1, 8, 8))
 
     def test_sampling_is_deterministic(self):
         kwargs = dict(coords=self.coords, num_steps=4, guidance=2.0, solver="heun", seed=3)
-        a = sample_ode(self.decoder, self.cond, self.z, **kwargs)
-        b = sample_ode(self.decoder, self.cond, self.z, **kwargs)
+        a = sample_ode(self.decoder, self.z, **kwargs)
+        b = sample_ode(self.decoder, self.z, **kwargs)
         torch.testing.assert_close(a, b)
 
     def test_all_solvers_run_and_stay_finite(self):
         for solver in ("euler", "midpoint", "heun"):
             out = sample_ode(
-                self.decoder, self.cond, self.z, coords=self.coords, num_steps=3, solver=solver, seed=0
+                self.decoder, self.z, coords=self.coords, num_steps=3, solver=solver, seed=0
             )
             self.assertTrue(bool(torch.isfinite(out).all()))
-            self.assertEqual(out.shape, self.cond.shape)
+            self.assertEqual(out.shape, (2, CODEC_CHANNELS, CODEC_SIZE, CODEC_SIZE))
 
     def test_guidance_one_matches_the_unguided_field(self):
-        a = sample_ode(self.decoder, self.cond, self.z, coords=self.coords, num_steps=3, guidance=1.0, seed=1)
-        b = sample_ode(self.decoder, self.cond, self.z, coords=self.coords, num_steps=3, guidance=1.0, seed=1)
+        a = sample_ode(self.decoder, self.z, coords=self.coords, num_steps=3, guidance=1.0, seed=1)
+        b = sample_ode(self.decoder, self.z, coords=self.coords, num_steps=3, guidance=1.0, seed=1)
         torch.testing.assert_close(a, b)
 
     def test_guidance_changes_the_result(self):
-        a = sample_ode(self.decoder, self.cond, self.z, coords=self.coords, num_steps=3, guidance=1.0, seed=1)
-        b = sample_ode(self.decoder, self.cond, self.z, coords=self.coords, num_steps=3, guidance=4.0, seed=1)
+        a = sample_ode(self.decoder, self.z, coords=self.coords, num_steps=3, guidance=1.0, seed=1)
+        b = sample_ode(self.decoder, self.z, coords=self.coords, num_steps=3, guidance=4.0, seed=1)
         self.assertGreater((a - b).abs().max().item(), 1e-6)
 
     def test_trajectory_has_one_state_per_knot(self):
         traj = sample_ode(
-            self.decoder, self.cond, self.z, coords=self.coords, num_steps=5, seed=0, return_trajectory=True
+            self.decoder, self.z, coords=self.coords, num_steps=5, seed=0, return_trajectory=True
         )
         self.assertEqual(traj.shape[0], 6)
 
@@ -389,16 +477,14 @@ class TestSampler(unittest.TestCase):
         """
         fresh = make_decoder().eval()
         kwargs = dict(coords=self.coords, num_steps=3, guidance=3.0, seed=0)
-        a = sample_ode(fresh, self.cond, self.z, **kwargs)
-        b = sample_ode(fresh, self.cond, torch.randn_like(self.z), **kwargs)
+        a = sample_ode(fresh, self.z, **kwargs)
+        b = sample_ode(fresh, torch.randn_like(self.z), **kwargs)
         torch.testing.assert_close(a, b)
 
     def test_latent_changes_the_sample(self):
         """The sample must depend on z, or the whole microscope is a mirror."""
-        a = sample_ode(self.decoder, self.cond, self.z, coords=self.coords, num_steps=3, seed=0)
-        b = sample_ode(
-            self.decoder, self.cond, torch.randn_like(self.z), coords=self.coords, num_steps=3, seed=0
-        )
+        a = sample_ode(self.decoder, self.z, coords=self.coords, num_steps=3, seed=0)
+        b = sample_ode(self.decoder, torch.randn_like(self.z), coords=self.coords, num_steps=3, seed=0)
         self.assertGreater((a - b).abs().max().item(), 1e-6)
 
 

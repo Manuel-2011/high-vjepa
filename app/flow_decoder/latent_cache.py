@@ -21,13 +21,30 @@ nothing is being asked of the decoder that the world model was not trained to
 predict. `--target-frame-in-tubelet first` is available for a control run; it is
 a global choice, never per world model.
 
-`z_target` is produced the same way `encode_ground_truth` in
-`evals/generate_world_model_report.py` produces its targets: the target encoder
-sees token j inside a *full-length* clip window ending at j, because that is the
-only way a token is ever produced during pretraining and a token embedded in
-isolation is a different vector. This is what makes the cached latents genuinely
-"the world model's latent space" rather than an artifact of how this script
-batched them.
+The latent-extraction protocol, which is the whole point of the cache:
+
+  1. The **teacher (target) encoder** does the encoding - the EMA branch, the one
+     that produced the targets the world model's own loss was computed against.
+     Not the context encoder, and not the predictor.
+  2. It is given a **full training-length clip window** ending at token j:
+     `geom.window_tokens` temporal tokens, i.e. `max(data.dataset_fpcs)` frames at
+     the model's own `fps`, `tubelet_size` and `crop_size`. Every one of those
+     numbers comes from the model's own pretraining config, so the encoder is
+     never shown a clip shape it was not trained on.
+  3. Only the **last temporal step's** `S` patch tokens are kept
+     (`tokens[:, -spatial_tokens:]`). Patch tokens are laid out `t * S + s`, so
+     that slice is exactly temporal index `window_tokens - 1`.
+
+Steps 2 and 3 together are the reason this is not the same as "embed one frame".
+The kept tokens have attended over the whole window, so they carry the clip's
+temporal context - the latent is *the last frame as the world model represents it
+in the context of its clip*. Handing the encoder a single frame instead would
+produce a different vector and would not be a point in the space the world model
+actually learned.
+
+This is index-for-index what `encode_ground_truth` in
+`evals/generate_world_model_report.py` does, so a latent cached here and a latent
+that report scores are the same tensor for the same (video, step).
 
 What is deliberately NOT cached: codec (VAE) latents. Encoding two 256px frames
 is a millisecond and the VAE is frozen and swappable, whereas re-running a ViT-L
@@ -222,6 +239,16 @@ def extract_clip_samples(
     z_targets: List[torch.Tensor] = []
     z_preds: List[torch.Tensor] = []
 
+    # Cheap, and it is the one invariant the whole cache rests on: the teacher must
+    # see exactly the clip length it was trained on, or the cached tokens are not
+    # points in the space the world model learned.
+    if geom.window_tokens * geom.tubelet_size != geom.frames_per_clip:
+        raise ValueError(
+            f"window is {geom.window_tokens} x {geom.tubelet_size} = "
+            f"{geom.window_tokens * geom.tubelet_size} frames but the model was trained on "
+            f"{geom.frames_per_clip}; the teacher would see an untrained clip shape."
+        )
+
     for step in range(geom.num_steps):
         window = step + 1
         target_token = window + geom.window_tokens - 1
@@ -406,6 +433,18 @@ def main() -> None:
 
     bundle = prepare_world_model(config, checkpoint, device)
     autocast_kwargs = autocast_config(config, device, args.use_amp)
+    logger.info(
+        "latent protocol: teacher (target) encoder over a full %d-frame training-length window "
+        "(%d temporal token(s) at %g fps, tubelet %d, crop %d - all from the model's own config); "
+        "keeping only the last temporal step's %d token(s) of width %d.",
+        geom.frames_per_clip,
+        geom.window_tokens,
+        geom.fps,
+        geom.tubelet_size,
+        geom.crop_size,
+        geom.spatial_tokens,
+        bundle.embed_dim,
+    )
 
     normalization = config["data"].get("normalization", DEFAULT_NORMALIZATION)
     transform = make_transforms(

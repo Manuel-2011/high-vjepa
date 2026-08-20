@@ -27,15 +27,18 @@ image. Determinism is not a nicety here: panels 3 and 6 hold the seed fixed and
 vary the latent or the world model, and any stochasticity in the solver would
 show up as a difference the reader would attribute to the latent.
 
-Classifier-free guidance drops only `z` (never `x_t`; see decoder.py), so the
-guidance scale interpolates between "next frame given the current frame alone"
-and "next frame given the current frame and the latent". The extrapolated field
+Classifier-free guidance drops only `z`. The extrapolated field
 
     v_w = v_uncond + w * (v_cond - v_uncond)
 
-at `w = 1` is exactly the conditional field; above 1 it amplifies whatever the
-latent contributes over persistence, which is what makes a guidance ladder a
-legible measurement rather than a knob.
+is exactly the conditional field at `w = 1`; above 1 it amplifies whatever the
+latent contributes over the unconditional branch. What that branch *is* depends
+on the decoder's `frame_conditioning` (see decoder.py): under the default `none`
+it is the decoder's prior over frames of this dataset, so the ladder measures
+what the latent adds over "a generic frame"; under `current_frame` it still sees
+`x_t`, so the ladder measures what the latent adds over "nothing moved". Both are
+legible measurements, but they are not the same measurement, and a panel caption
+that names the wrong one is worse than no caption.
 """
 
 from __future__ import annotations
@@ -123,17 +126,19 @@ class RectifiedFlow(nn.Module):
     def loss(
         self,
         target_latent: torch.Tensor,
-        cond_latent: torch.Tensor,
         z: torch.Tensor,
+        cond_latent: Optional[torch.Tensor] = None,
         coords: Optional[torch.Tensor] = None,
         z_mask: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """MSE between the predicted and true velocity, plus diagnostics.
 
-        `target_latent` is the codec latent of x_{t+1}, `cond_latent` that of
-        x_t. Everything stochastic (tau, eps, the dropout mask, sigma) is drawn
-        here so a training step is one call.
+        `target_latent` is the codec latent of the frame being reconstructed and
+        `z` the world model's tokens for it. `cond_latent` is the codec latent of
+        the preceding frame, required only when the decoder was built with
+        `frame_conditioning='current_frame'`. Everything stochastic (tau, eps,
+        the dropout mask, sigma) is drawn here so a training step is one call.
         """
         cfg = self.config
         b = target_latent.size(0)
@@ -166,8 +171,8 @@ class RectifiedFlow(nn.Module):
         prediction = self.decoder(
             x_tau=x_tau,
             tau=tau,
-            cond_latent=cond_latent,
             z=z,
+            cond_latent=cond_latent,
             coords=coords,
             z_mask=z_mask,
             sigma=sigma,
@@ -210,8 +215,8 @@ def timestep_schedule(num_steps: int, device: torch.device, shift: float = 1.0) 
 @torch.no_grad()
 def sample_ode(
     decoder: nn.Module,
-    cond_latent: torch.Tensor,
     z: torch.Tensor,
+    cond_latent: Optional[torch.Tensor] = None,
     coords: Optional[torch.Tensor] = None,
     z_mask: Optional[torch.Tensor] = None,
     num_steps: int = 50,
@@ -230,21 +235,27 @@ def sample_ode(
     num_steps, shift)`. Returns (B, C, h, w), or the stacked trajectory
     (num_steps + 1, B, C, h, w) if `return_trajectory`.
 
+    `cond_latent` is required only under `frame_conditioning='current_frame'`;
+    otherwise the output shape comes from `decoder.latent_shape`, since there is
+    no conditioning image to read it off.
+
     The conditioning memory is built once, outside the solver loop: it does not
     depend on tau, and for Config B with a 1024-token latent the cross-attention
     keys are the bulk of the sampling cost.
     """
     if solver not in SOLVERS:
         raise ValueError(f"unknown solver {solver!r}; expected one of {SOLVERS}")
-    device = cond_latent.device
-    b = cond_latent.size(0)
+    device = z.device
+    b = z.size(0)
+    shape = decoder.latent_shape(b)
+    compute_dtype = cond_latent.dtype if cond_latent is not None else z.dtype
 
     if noise is None:
         generator = None
         if seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(seed))
-        noise = torch.randn(cond_latent.shape, device=device, generator=generator, dtype=torch.float32)
+        noise = torch.randn(shape, device=device, generator=generator, dtype=torch.float32)
     x = noise.to(device=device, dtype=torch.float32)
 
     memory, memory_mask, sigma_used = decoder.encode_conditioning(
@@ -263,12 +274,12 @@ def sample_ode(
 
     def velocity(state: torch.Tensor, tau_value: torch.Tensor) -> torch.Tensor:
         v_cond = decoder.forward_with_memory(
-            state.to(cond_latent.dtype), tau_value, cond_latent, memory, memory_mask, sigma_used
+            state.to(compute_dtype), tau_value, cond_latent, memory, memory_mask, sigma_used
         ).float()
         if not guided:
             return v_cond
         v_uncond = decoder.forward_with_memory(
-            state.to(cond_latent.dtype), tau_value, cond_latent, null_memory, null_mask, null_sigma
+            state.to(compute_dtype), tau_value, cond_latent, null_memory, null_mask, null_sigma
         ).float()
         return v_uncond + guidance * (v_cond - v_uncond)
 
@@ -306,14 +317,15 @@ def sample_ode(
 def decode_frames(
     decoder: nn.Module,
     codec,
-    cond_frames: torch.Tensor,
     z: torch.Tensor,
+    cond_frames: Optional[torch.Tensor] = None,
     **sample_kwargs,
 ) -> torch.Tensor:
-    """End-to-end D(x_t, z) -> x_hat_{t+1} in pixel space.
+    """End-to-end D(z) -> x_hat in pixel space, in [0, 1].
 
-    `cond_frames` is (B, 3, H, W) in [0, 1]. Returns the same, clamped.
+    `cond_frames` (B, 3, H, W) in [0, 1] is needed only under
+    `frame_conditioning='current_frame'`.
     """
-    cond_latent = codec.encode(cond_frames)
-    latent = sample_ode(decoder, cond_latent=cond_latent, z=z, **sample_kwargs)
+    cond_latent = codec.encode(cond_frames) if cond_frames is not None else None
+    latent = sample_ode(decoder, z=z, cond_latent=cond_latent, **sample_kwargs)
     return codec.decode(latent)

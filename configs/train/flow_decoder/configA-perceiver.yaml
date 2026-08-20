@@ -38,6 +38,11 @@ codec:
 
 model:
   conditioning: perceiver
+  # `none` = reconstruct from the latent tokens alone; the decoder never sees the
+  # preceding frame, so whatever appears in a sample came from the latent. This is
+  # the setting the deliverable is about. `current_frame` also feeds x_t, which
+  # makes the task much easier and the measurement much weaker.
+  frame_conditioning: none
   patch_size: 2
   dim: 768
   depth: 12

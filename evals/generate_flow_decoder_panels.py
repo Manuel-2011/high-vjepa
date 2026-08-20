@@ -243,6 +243,7 @@ def load_decoder(
         cond_dim=int(model_cfg.get("cond_dim", 768)),
         mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
         conditioning=str(model_cfg.get("conditioning", "perceiver")),
+        frame_conditioning=str(model_cfg.get("frame_conditioning", "none")),
         num_queries=int(model_cfg.get("num_queries", 128)),
         resampler_depth=int(model_cfg.get("resampler_depth", 2)),
         resampler_heads=int(model_cfg.get("resampler_heads", 8)),
@@ -361,11 +362,18 @@ def decode(
     seed: Optional[int] = None,
     coords: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """One D(x_t, z) call in pixel space. `cond_frames` is (B, 3, H, W) in [0, 1]."""
+    """One decode in pixel space.
+
+    `cond_frames` (B, 3, H, W) in [0, 1] is passed to the decoder only under
+    `frame_conditioning='current_frame'`; under `none` it is ignored here, so the
+    panels can hold one call signature while the reconstruction genuinely has no
+    access to it.
+    """
+    uses_frame = bundle.decoder.uses_frame_conditioning
     latent = sample_ode(
         bundle.decoder,
-        cond_latent=codec.encode(cond_frames).float(),
         z=z,
+        cond_latent=codec.encode(cond_frames).float() if uses_frame else None,
         coords=bundle.coords if coords is None else coords,
         num_steps=settings.num_steps,
         guidance=settings.guidance if guidance is None else guidance,
@@ -430,9 +438,12 @@ def panel_reconstruction(
         stats["psnr_copy"].append(psnr(sample["prev"], sample["next"]))
         stats["psnr_ceiling"].append(psnr(ceiling, sample["next"]))
 
-    columns = ["x_t (input)", "x_{t+1} (truth)", "codec ceiling", "D(x_t, z_target)"]
+    uses_frame = bundle.decoder.uses_frame_conditioning
+    first = "x_t (decoder input)" if uses_frame else "x_t (context only)"
+    signature = "D(x_t, z" if uses_frame else "D(z"
+    columns = [first, "x_{t+1} (truth)", "codec ceiling", f"{signature}_target)"]
     if has_pred:
-        columns.append("D(x_t, z_pred)")
+        columns.append(f"{signature}_pred)")
 
     path = output_dir / f"panel1-reconstruction-{slug(bundle.name)}.png"
     save_panel(
@@ -444,7 +455,13 @@ def panel_reconstruction(
         caption=(
             f"{settings.describe()}. The `codec ceiling` column is decode(encode(truth)) and bounds every "
             "column to its right; compare against it, not against the truth. `copy` PSNR "
-            f"{np.mean(stats['psnr_copy']):.2f} dB is the persistence baseline."
+            f"{np.mean(stats['psnr_copy']):.2f} dB is the persistence baseline"
+            + (
+                " - and, since the decoder is given x_t, a floor it could reach by echoing its input."
+                if uses_frame
+                else " - a reference for how much the scene moved, NOT something this decoder could "
+                "reach by copying: it never sees x_t."
+            )
         ),
     )
     summary = {k: float(np.mean(v)) for k, v in stats.items()}
@@ -501,9 +518,15 @@ def panel_guidance(
         f"Panel 2 - guidance ladder: {bundle.name}",
         caption=(
             f"{settings.solver} solver, {settings.num_steps} step(s), seed {settings.seed} held fixed across the "
-            "row. Only z is dropped for the unconditional branch, never x_t, so w = 0 is 'next frame from this "
-            "frame alone' and the row measures what the latent adds over persistence. Mean |w=0 - w=1| = "
-            f"{np.nanmean(drift):.4f}."
+            "row. Only z is dropped for the unconditional branch, so w = 0 is "
+            + (
+                "'next frame from this frame alone' and the row measures what the latent adds over "
+                "persistence."
+                if bundle.decoder.uses_frame_conditioning
+                else "the decoder's unconditional prior over frames of this dataset - it sees NOTHING about "
+                "this clip - and the row measures what the latent adds over a generic frame."
+            )
+            + f" Mean |w=0 - w=1| = {np.nanmean(drift):.4f}."
         ),
     )
     logger.info("panel 2 (%s): mean |w=0 - w=1| = %.4f", bundle.name, float(np.nanmean(drift)))
@@ -818,26 +841,44 @@ def panel_crossmodel(
     row_labels.extend(["x_t (input)", "x_{t+1} (truth)"])
 
     swap_rows: List[List[np.ndarray]] = []
+    follows_latent: Dict[str, float] = {}
     for bundle, codec in zip(bundles, codecs):
-        row, swap_row = [], []
-        for index in indices:
+        row, swap_row, follows = [], [], []
+        for position, index in enumerate(indices):
             sample = fetch(bundle, index, device)
             decoded = decode(bundle, codec, sample["prev"], sample["z_target"], settings)
             row.append(to_numpy_image(decoded[0]))
             plt.imsave(frames_dir / f"{slug(bundle.name)}-{index}.png", to_numpy_image(decoded[0]))
             per_model_files[bundle.name][index] = f"crossmodel_frames/{slug(bundle.name)}-{index}.png"
 
-            # Latent-swap control: x_t from this sample, z from a different one.
-            other = indices[(list(indices).index(index) + 1) % len(indices)]
-            swapped = fetch(bundle, other, device)["z_target"]
-            swap_row.append(to_numpy_image(decode(bundle, codec, sample["prev"], swapped, settings)[0]))
+            # Latent-swap control: this column's position, a DIFFERENT clip's
+            # latent. Scored rather than merely displayed, because the visual
+            # check only works when the decoder also has a frame to leak from:
+            # with `frame_conditioning='none'` there is no x_t, so "does it still
+            # look like this column" is vacuous. Asking instead whether the output
+            # moved TOWARDS the donor clip is a control that works in both modes.
+            donor = fetch(bundle, indices[(position + 1) % len(indices)], device)
+            swapped = decode(bundle, codec, sample["prev"], donor["z_target"], settings)
+            to_own = (swapped - sample["next"]).abs().mean().item()
+            to_donor = (swapped - donor["next"]).abs().mean().item()
+            follows.append(to_donor < to_own)
+            swap_row.append(to_numpy_image(swapped[0]))
         rows.append(row)
         row_labels.append(bundle.name)
         swap_rows.append(swap_row)
+        follows_latent[bundle.name] = float(np.mean(follows)) if follows else float("nan")
+        logger.info(
+            "panel 6 (%s): swapped output closer to the donor clip than to its own column in %.0f%% of "
+            "cases (chance is 50%%; low values mean the decoder is not following its latent)",
+            bundle.name,
+            100.0 * follows_latent[bundle.name],
+        )
 
     for bundle, swap_row in zip(bundles, swap_rows):
         rows.append(swap_row)
-        row_labels.append(f"{bundle.name}\n[latent swapped]")
+        row_labels.append(
+            f"{bundle.name}\n[latent swapped]\nfollows {100.0 * follows_latent[bundle.name]:.0f}%"
+        )
 
     for index in indices:
         sample = fetch(reference, index, device)
@@ -852,9 +893,10 @@ def panel_crossmodel(
         path,
         "Panel 6 - cross-model comparison on identical inputs",
         caption=(
-            f"{settings.describe()}, identical for every row. The `[latent swapped]` rows decode each x_t "
-            "against a DIFFERENT clip's latent: if a swapped row still resembles its own column, that "
-            "decoder is ignoring the latent and the rows above it say nothing about latent quality."
+            f"{settings.describe()}, identical for every row. The `[latent swapped]` rows decode against a "
+            "DIFFERENT clip's latent; `follows` is the fraction of swapped samples closer to the donor "
+            "clip's true frame than to their own column's. Chance is 50%; well above it means the decoder "
+            "tracks its latent, at or below it means the rows above say nothing about latent quality."
         ),
     )
 
@@ -879,7 +921,12 @@ def panel_crossmodel(
             indent=2,
         )
     logger.info("panel 6: %d model(s) x %d clip(s); %d 2AFC pair(s) written", len(bundles), len(indices), len(pairs))
-    return {"path": path, "num_pairs": len(pairs), "models": names}
+    return {
+        "path": path,
+        "num_pairs": len(pairs),
+        "models": names,
+        **{f"follows_latent[{name}]": value for name, value in follows_latent.items()},
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -921,15 +968,50 @@ def write_report(
     lines += [
         "## Runs",
         "",
-        "| world model | d_m | grid | latents | weights | codec ceiling |",
-        "|---|---|---|---|---|---|",
+        "| world model | d_m | grid | latents | frame cond. | weights | codec ceiling |",
+        "|---|---|---|---|---|---|---|",
     ]
     for bundle in bundles:
         lines.append(
             f"| {bundle.name} | {bundle.latent_dim} | {tuple(bundle.decoder.latent_grid)} | "
-            f"{bundle.provenance.get('latent_source')} | {bundle.provenance.get('weights')} | "
-            f"{bundle.codec_ceiling_db:.2f} dB |"
+            f"{bundle.provenance.get('latent_source')} | {bundle.decoder.frame_conditioning} | "
+            f"{bundle.provenance.get('weights')} | {bundle.codec_ceiling_db:.2f} dB |"
         )
+    lines.append("")
+
+    latent_only = not bundles[0].decoder.uses_frame_conditioning
+    lines += [
+        "",
+        "## What the decoder was given",
+        "",
+    ]
+    if latent_only:
+        lines += [
+            "`frame_conditioning: none` - **the decoder reconstructs from the latent tokens alone.** Its "
+            "only input is the world model's tokens for the target temporal step; it never sees the "
+            "preceding frame, in training or at sampling time. So anything visible in a reconstruction was "
+            "carried by those tokens, because there was no other source for it.",
+            "",
+            "Those tokens come from the **teacher (target) encoder** run over a **full training-length clip "
+            "window** ending at the target step, exactly as `evals/generate_world_model_report.py` builds "
+            "its targets - so a token here is the same vector the world model's own loss was computed "
+            "against, not an artifact of encoding a frame in isolation. Only the **last temporal step's** "
+            "tokens are handed to the decoder; the earlier steps of the window exist so that the encoder "
+            "sees the clip length and temporal context it was trained on.",
+            "",
+            "Two consequences for reading the panels. Samples are markedly blurrier than a "
+            "frame-conditioned decoder's, and that is the measurement rather than a defect - a JEPA "
+            "representation is trained for prediction, not reconstruction, and discards appearance detail "
+            "it does not need. And the persistence/`copy` reference in panel 1 is no longer a floor the "
+            "decoder could reach by echoing an input, because it has no input to echo.",
+        ]
+    else:
+        lines += [
+            "`frame_conditioning: current_frame` - the decoder sees the preceding frame `x_t` as well as "
+            "the latent, so the task is `D(x_t, z) -> x_hat`. Easier, and weaker as a measurement: a "
+            "sample can look plausible while barely reading the latent. **Check panel 6's `follows` figure "
+            "before reading anything else.**",
+        ]
     lines.append("")
 
     descriptions = {
@@ -948,8 +1030,9 @@ def write_report(
         "token_ablation": "**Panel 5 - token ablation.** Replace a block of latent tokens with the "
         "no-information token and re-decode from the same seed. A tight difference map over the block's own "
         "region means tokens still govern where they sit.",
-        "crossmodel": "**Panel 6 - cross-model.** The comparison itself, plus the latent-swap control that "
-        "certifies the decoders are reading their latents at all.",
+        "crossmodel": "**Panel 6 - cross-model.** The comparison itself, plus the latent-swap control. "
+        "`follows` is the fraction of swapped samples that land closer to the donor clip's true frame than "
+        "to their own column's; chance is 50%, and a decoder tracking its latent should be well above it.",
     }
 
     for panel in PANELS:
@@ -973,12 +1056,23 @@ def write_report(
     lines += [
         "## How to read a null result",
         "",
-        "Two failure modes look like findings and are not:",
+        "Failure modes that look like findings and are not:",
         "",
         "1. A blurry sample whose `codec ceiling` neighbour is also blurry. That is the frozen VAE, and it "
-        "says nothing about the world model.",
-        "2. A latent-swap row in panel 6 that still resembles its own column. That decoder is reconstructing "
-        "from `x_t` and ignoring `z`; every other panel for that run is void.",
+        "says nothing about the world model. Always read panel 1 against the ceiling column.",
+        "2. A panel-6 `follows` figure at or below 50%. That decoder is not tracking its latent, and every "
+        "other panel for that run is void."
+        + (
+            " With `frame_conditioning: none` there is no frame to fall back on, so this failure shows up "
+            "as reconstructions that are plausible but generic - the same scene regardless of latent - "
+            "rather than as copies of the input."
+            if latent_only
+            else " With `frame_conditioning: current_frame` this failure shows up as reconstructions that "
+            "are near-copies of `x_t`."
+        ),
+        "3. Blur that is uniform across every world model being compared. The comparison is *relative*; a "
+        "shared blur level is a property of this decoder configuration and step budget, not of any one "
+        "latent space.",
         "",
         "The decoder is also not a generative product model, and no attempt is made to make it one - no GAN "
         "loss, no perceptual loss, no discriminator. Sharpness that came from an adversarial term would be "

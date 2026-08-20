@@ -1,14 +1,57 @@
 # Flow-Matching Decoder
 
-`D(x_t, z_{t+1}) -> x_hat_{t+1}` — reconstruct the next video frame at pixel level
-from the current frame plus the latent tokens a **frozen** world model emits for
-the next step.
+`D(z) -> x_hat` — reconstruct a video frame at pixel level **from the latent
+tokens of a frozen world model alone.**
 
 This is a **qualitative microscope for comparing frozen world-model latent
 spaces**, not a generative product model. Sample sharpness and controlled
 comparability are what it optimizes for; FID leaderboards are explicitly not the
 goal. Everything upstream of it — every world model, and the VAE — is loaded,
 `eval()`-ed and `requires_grad_(False)`-ed, and never trained here.
+
+## What the decoder is given
+
+By default (`model.frame_conditioning: none`) the latent tokens are the decoder's
+**only** input. It never sees the frame it is reconstructing, nor the frame
+before it, in training or at sampling time — so anything visible in a
+reconstruction was carried by those tokens, because there was no other source.
+
+The tokens are produced by a fixed protocol, logged on every cache run:
+
+1. The **teacher (target) encoder** does the encoding — the EMA branch that
+   produced the targets the world model's own loss was computed against. Not the
+   context encoder, not the predictor.
+2. It sees a **full training-length clip window** ending at the target step:
+   `max(data.dataset_fpcs)` frames at the model's own `fps`, `tubelet_size` and
+   `crop_size`. Every number comes from that model's pretraining config, so the
+   encoder is never shown a clip shape it was not trained on.
+3. Only the **last temporal step's** `S` patch tokens are handed to the decoder.
+   Patch tokens are laid out `t * S + s`, so that is exactly temporal index
+   `window_tokens - 1`.
+
+Steps 2 and 3 together are why this differs from "embed one frame": the kept
+tokens attended over the whole window, so the latent is *the last frame as the
+world model represents it in the context of its clip*. This is index-for-index
+what [generate_world_model_report.py](../../evals/generate_world_model_report.py)'s
+`encode_ground_truth` does, so a latent cached here is the same tensor that report
+scores.
+
+Expect **markedly blurrier samples** than a frame-conditioned decoder produces.
+That is the measurement, not a defect: a JEPA representation is trained for
+prediction and discards appearance detail it does not need.
+
+### The frame-conditioned variant
+
+`model.frame_conditioning: current_frame` also feeds the codec latent of the
+preceding frame, making the task `D(x_t, z) -> x_hat`. Much easier, much weaker
+as a measurement — a sample can look plausible while barely reading the latent.
+Kept because the *difference* between the two modes is itself informative, but
+`none` is the default and the setting the deliverable is about.
+
+The two modes give the patchify conv different input widths, so a checkpoint from
+one **cannot** load into the other; it raises rather than loading wrongly. The
+mode also lives in `model_config`, so the panel harness's audit refuses to
+compare a `none` run against a `current_frame` one.
 
 ## Layout
 
@@ -154,21 +197,26 @@ rather than producing a picture that looks like a finding.
 
 | panel | question |
 |---|---|
-| 1 `reconstruction` | What does the latent pin down? `x_t` \| truth \| **codec ceiling** \| `D(x_t, z_target)` \| `D(x_t, z_pred)` |
+| 1 `reconstruction` | What does the latent pin down? `x_t` (context) \| truth \| **codec ceiling** \| `D(z_target)` \| `D(z_pred)` |
 | 2 `guidance` | What does the latent add over persistence? CFG sweep `w = 0 … 5` |
 | 3 `seeds` | What does the latent leave free? Same latent, K seeds, + per-pixel std map |
 | 4 `lead_time` | How does legibility decay with distance? Teacher-forced ladder, or caller-supplied rollout latents |
 | 5 `token_ablation` | Which pixels does which token block govern? |
-| 6 `crossmodel` | The comparison itself, + a **latent-swap control** |
+| 6 `crossmodel` | The comparison itself, + a scored **latent-swap control** (`follows`) |
 
 Two failure modes look like findings and are not, and the report says so:
 
 1. A blurry sample whose **codec ceiling** neighbour is also blurry — that is the
    frozen VAE, and it says nothing about the world model. Always read panel 1
    against the ceiling column, never against the truth.
-2. A **latent-swap** row in panel 6 that still resembles its own column — that
-   decoder is reconstructing from `x_t` and ignoring `z`, and every other panel
-   for that run is void.
+2. A panel-6 **`follows`** figure at or below 50% — the fraction of latent-swapped
+   samples that land closer to the donor clip's true frame than to their own
+   column's. At chance, the decoder is not tracking its latent and every other
+   panel for that run is void. Under `none` this failure looks like plausible but
+   *generic* reconstructions (the same scene whatever the latent); under
+   `current_frame` it looks like near-copies of `x_t`.
+3. Blur that is **uniform across every model** compared — a property of this
+   decoder configuration and step budget, not of any one latent space.
 
 Rollout latents for panel 4 are **supplied by the caller**; this harness never
 rolls a world model forward (that is `evals/generate_world_model_report.py`'s

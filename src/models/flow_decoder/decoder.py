@@ -3,28 +3,41 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""D(x_t, z_{t+1}) -> x_hat_{t+1}: the flow-matching decoder.
+"""D(z) -> x_hat: the flow-matching decoder.
 
 What it is. A DiT that predicts the rectified-flow velocity field over the
-frozen codec's latent of the *next* frame, conditioned on two things:
+frozen codec's latent of a target frame, conditioned on the latent tokens a
+frozen world model emits for that frame. Those tokens enter through
+cross-attention: they are not aligned with the target in any fixed way (the grid
+may be coarser or finer), and they vary in length and width between world
+models - hence attention rather than concatenation.
 
-  * `x_t`, the current frame, entering as extra channels concatenated to the
-    noisy target latent. Channel concatenation rather than cross-attention
-    because `x_t` is spatially aligned with the target pixel-for-pixel - it is
-    the same scene one step earlier - so the alignment is free information that
-    a convolutional patchify preserves and attention would have to rediscover.
-  * `z_{t+1}`, the world model's latent tokens for the target step, entering
-    through cross-attention. Not aligned with the target in any fixed way (its
-    grid may be coarser, finer, or temporally pooled), and of varying length and
-    width - hence attention.
+Two frame-conditioning modes, set by `frame_conditioning` and chosen globally for
+a comparison (never per world model):
 
-Why the asymmetry matters for the deliverable. `x_t` is always present and is
-never dropped; only `z` is dropped for classifier-free guidance. So the guidance
-scale sweeps *the latent's contribution alone*, against a baseline that already
-knows the current frame. Panel 2's guidance ladder is therefore a direct read-out
-of how much the latent adds over persistence - which is exactly the question a
-microscope on latent spaces should be answering, and it would be muddied if the
-unconditional branch had to hallucinate the scene from scratch.
+  `none` (default) - the latent is the ONLY input. The decoder must rebuild the
+      frame from the world model's tokens and nothing else, so the sample is a
+      direct read-out of what those tokens contain. This is the setting the
+      deliverable is about: whatever appears in the image was in the latent,
+      because there was no other source for it.
+
+  `current_frame` - the codec latent of the preceding frame `x_t` is
+      concatenated channel-wise to the noisy target, making the task
+      `D(x_t, z) -> x_hat`. Channel concatenation rather than cross-attention
+      because `x_t` is spatially aligned with the target pixel-for-pixel. Much
+      easier, and much weaker as a measurement: a decoder given the previous
+      frame can produce a plausible image while barely reading the latent, and
+      distinguishing the two cases then needs the latent-swap control.
+
+The mode changes what classifier-free guidance means, which matters for reading
+the panels. Only `z` is ever dropped for the unconditional branch, so:
+
+  * under `none`, `w = 0` is the decoder's unconditional prior over frames of
+    this dataset, and the guidance ladder sweeps what the latent adds over
+    "a generic frame".
+  * under `current_frame`, `w = 0` still sees `x_t`, so it is a *persistence*
+    prior and the ladder sweeps what the latent adds over "the scene did not
+    change".
 
 Two conditioning routes, selected by `conditioning`:
 
@@ -64,6 +77,7 @@ from src.models.utils.pos_embs import get_2d_sincos_pos_embed
 logger = logging.getLogger(__name__)
 
 CONDITIONING_MODES = ("perceiver", "direct")
+FRAME_CONDITIONING_MODES = ("none", "current_frame")
 
 
 class FlowMatchingDecoder(nn.Module):
@@ -94,6 +108,7 @@ class FlowMatchingDecoder(nn.Module):
         cond_dim: int = 768,
         mlp_ratio: float = 4.0,
         conditioning: str = "perceiver",
+        frame_conditioning: str = "none",
         num_queries: int = 128,
         resampler_depth: int = 2,
         resampler_heads: int = 8,
@@ -104,6 +119,10 @@ class FlowMatchingDecoder(nn.Module):
         super().__init__()
         if conditioning not in CONDITIONING_MODES:
             raise ValueError(f"conditioning must be one of {CONDITIONING_MODES}; got {conditioning!r}")
+        if frame_conditioning not in FRAME_CONDITIONING_MODES:
+            raise ValueError(
+                f"frame_conditioning must be one of {FRAME_CONDITIONING_MODES}; got {frame_conditioning!r}"
+            )
         if codec_size % patch_size:
             raise ValueError(f"codec_size {codec_size} is not divisible by patch_size {patch_size}")
 
@@ -115,6 +134,8 @@ class FlowMatchingDecoder(nn.Module):
         self.dim = dim
         self.cond_dim = cond_dim
         self.conditioning = conditioning
+        self.frame_conditioning = frame_conditioning
+        self.uses_frame_conditioning = frame_conditioning == "current_frame"
         self.use_activation_checkpointing = use_activation_checkpointing
         self.grid_side = codec_size // patch_size
         self.num_tokens = self.grid_side**2
@@ -143,9 +164,13 @@ class FlowMatchingDecoder(nn.Module):
         self.null_memory = nn.Parameter(torch.randn(1, 1, cond_dim) * 0.02)
 
         # -- x_tau path --------------------------------------------------------
-        # 2 * codec_channels in: the noisy target latent, and x_t's latent.
+        # One codec_channels block for the noisy target latent, plus a second one
+        # for x_t's latent only under `current_frame`. This is the only place the
+        # frame-conditioning mode changes a parameter shape, so a checkpoint from
+        # one mode will refuse to load into the other rather than load wrongly.
+        self.patchify_channels = codec_channels * (2 if self.uses_frame_conditioning else 1)
         self.patchify = nn.Conv2d(
-            2 * codec_channels, dim, kernel_size=patch_size, stride=patch_size, bias=True
+            self.patchify_channels, dim, kernel_size=patch_size, stride=patch_size, bias=True
         )
         pos = get_2d_sincos_pos_embed(dim, self.grid_side, cls_token=False)
         self.register_buffer("pos_embed", torch.from_numpy(pos).float().unsqueeze(0), persistent=False)
@@ -196,6 +221,14 @@ class FlowMatchingDecoder(nn.Module):
     def default_coords(self, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """(L, 6) coordinates for `self.latent_grid`."""
         return build_token_coords(self.latent_grid, device=device, dtype=dtype)
+
+    def latent_shape(self, batch_size: int) -> Tuple[int, int, int, int]:
+        """Shape of the codec latent this decoder produces.
+
+        The sampler needs it to draw its initial noise. Under `none` there is no
+        `cond_latent` to read a shape off, so it has to come from here.
+        """
+        return (int(batch_size), self.codec_channels, self.codec_size, self.codec_size)
 
     def unpatchify(self, tokens: torch.Tensor) -> torch.Tensor:
         """(B, N, p*p*C) -> (B, C, codec_size, codec_size)."""
@@ -278,7 +311,7 @@ class FlowMatchingDecoder(nn.Module):
         self,
         x_tau: torch.Tensor,
         tau: torch.Tensor,
-        cond_latent: torch.Tensor,
+        cond_latent: Optional[torch.Tensor],
         memory: torch.Tensor,
         memory_mask: Optional[torch.Tensor],
         sigma: torch.Tensor,
@@ -290,12 +323,27 @@ class FlowMatchingDecoder(nn.Module):
                 f"x_tau must be (B, {self.codec_channels}, {self.codec_size}, {self.codec_size}); "
                 f"got {tuple(x_tau.shape)}"
             )
-        if cond_latent.shape != x_tau.shape:
-            raise ValueError(
-                f"cond_latent {tuple(cond_latent.shape)} must match x_tau {tuple(x_tau.shape)}"
-            )
-
-        h = self.patchify(torch.cat([x_tau, cond_latent], dim=1))
+        if self.uses_frame_conditioning:
+            if cond_latent is None:
+                raise ValueError(
+                    "frame_conditioning='current_frame' needs cond_latent, the codec latent of x_t."
+                )
+            if cond_latent.shape != x_tau.shape:
+                raise ValueError(
+                    f"cond_latent {tuple(cond_latent.shape)} must match x_tau {tuple(x_tau.shape)}"
+                )
+            h = self.patchify(torch.cat([x_tau, cond_latent], dim=1))
+        else:
+            # Raise rather than ignore: silently dropping a frame the caller
+            # believed was being used would make every panel unreadable, and the
+            # two modes are otherwise indistinguishable from the outside.
+            if cond_latent is not None:
+                raise ValueError(
+                    "frame_conditioning='none' reconstructs from the latent alone, but a cond_latent "
+                    "was supplied. Pass None, or build the decoder with "
+                    "frame_conditioning='current_frame'."
+                )
+            h = self.patchify(x_tau)
         h = h.flatten(2).transpose(1, 2) + self.pos_embed.to(h.dtype)
 
         tau = tau.to(x_tau.device).reshape(-1).float()
@@ -315,8 +363,8 @@ class FlowMatchingDecoder(nn.Module):
         self,
         x_tau: torch.Tensor,
         tau: torch.Tensor,
-        cond_latent: torch.Tensor,
         z: torch.Tensor,
+        cond_latent: Optional[torch.Tensor] = None,
         coords: Optional[torch.Tensor] = None,
         z_mask: Optional[torch.Tensor] = None,
         sigma: Optional[torch.Tensor] = None,
@@ -328,8 +376,9 @@ class FlowMatchingDecoder(nn.Module):
         Args:
             x_tau: (B, C, h, w) point on the flow path.
             tau: (B,) or scalar flow time in [0, 1].
-            cond_latent: (B, C, h, w) codec latent of `x_t`.
             z: (B, L, d_m) world-model latents for the target step.
+            cond_latent: (B, C, h, w) codec latent of `x_t`. Required under
+                `frame_conditioning='current_frame'`, forbidden under `none`.
             coords: (B, L, 6) or (L, 6) continuous coordinates; defaults to
                 `self.latent_grid`.
             z_mask: (B, L) bool, True where `z` is real rather than padding.
@@ -355,7 +404,8 @@ class FlowMatchingDecoder(nn.Module):
         )
         adapter = sum(p.numel() for n, p in self.named_parameters() if n.startswith("adapter.proj"))
         return (
-            f"FlowMatchingDecoder[{self.conditioning}] d_m={self.latent_dim} grid={self.latent_grid} "
+            f"FlowMatchingDecoder[{self.conditioning}, frame={self.frame_conditioning}] "
+            f"d_m={self.latent_dim} grid={self.latent_grid} "
             f"codec={self.codec_channels}x{self.codec_size}^2 dim={self.dim} "
             f"tokens={self.num_tokens} params={self.num_parameters() / 1e6:.1f}M "
             f"(world-model-specific: {adapter / 1e6:.2f}M, shared: {shared / 1e6:.1f}M)"
