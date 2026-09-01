@@ -1,0 +1,138 @@
+# Causal (future-prediction) post-training at 4fps, GUIDED by the frozen 0.5fps causal
+# model. Every predictor block gets a cross-attention layer that reads the latents the
+# 0.5fps model predicts for 2 seconds ahead, so each 0.5s prediction step of this model
+# is conditioned on where the long-horizon model thinks the scene is heading.
+#
+# Timing (this is what `guidance.fps` buys you):
+#   student : 4fps, tubelet 2  -> one token per 0.5s, predicts 0.5s ahead
+#   guidance: 0.5fps           -> one token per 2s,   predicts 2s ahead
+#   => 4 student steps per guidance step; one guidance latent guides 4 predictions.
+#
+# The guidance model's low-fps view is subsampled from the *same* clip inside the
+# training step (frames 0,1, 8,9, 16,17, ... of the 4fps clip), matching how it was
+# trained, so `meta.use_pretrained_model` must stay off here.
+#
+# Causality: a student token may only read a guidance latent whose own context ends no
+# later than the student's own context. Those latents are predictions rather than
+# observations, so no future frame leaks.
+app: vjepa_guided
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 1
+mem_per_gpu: 46G
+folder: preliminary_experiments/EK100-vjepa-16f-4fps-causal-guided-by-0.5fps
+data:
+  dataset_type: VideoDataset
+  datasets:
+  - data/ek100_64frames_4fps_train.csv
+  - data/ek55_64frames_4fps_train.csv
+  datasets_weights:
+  - 0.5
+  - 0.5
+  batch_size: 64
+  crop_size: 256
+  patch_size: 16
+  # Must be a whole number of guidance steps (fps/guidance.fps = 8 frames each).
+  # 16 frames = 4s = 2 guidance steps. Raise to 64 (16s, 8 guidance steps) to give the
+  # guidance model the full-length context it was trained with, at 4x the student cost.
+  dataset_fpcs:
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 8
+  persistent_workers: true
+  pin_mem: true
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+# NOTE: with `model.is_causal: true` the masks below are never used, but they still size
+# the predictor's mask-token list (num_mask_tokens = len(mask) * len(dataset_fpcs) = 4).
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+guidance:
+  # Frozen long-horizon world model: the 0.5fps causal run.
+  checkpoint: preliminary_experiments/EK100-vjepa-16f-0.5fps-causal-after-causal-4fps-on-original-vjepa2-ckpt/latest.pt
+  fps: 0.5
+  tubelet_size: 2
+  # Must match the checkpoint's predictor: len(mask) * len(dataset_fpcs) of *that* run.
+  num_mask_tokens: 4
+  # Per-channel gate on each cross-attention residual. 0.0 means the model starts out
+  # exactly as the un-guided checkpoint it is initialized from and has to learn to open
+  # the gate; a small positive value (e.g. 1.0e-4) starts it leaning on guidance sooner.
+  gate_init: 0.0
+  # How many of the most recent readable guidance steps a token may attend to.
+  # null = every past one; 1 = only the latest 2s-ahead prediction.
+  window: null
+  # Architecture of the guidance model; defaults to the student's when omitted.
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  load_checkpoint: true
+  # Start from the un-guided 4fps causal model: everything but the cross-attention is
+  # loaded, and the new parameters are logged as freshly initialized.
+  read_checkpoint: preliminary_experiments/EK100-vjepa-16f-4fps-causal-original-vjepa2-ckpt/latest.pt
+  save_every_freq: 50
+  seed: 239
+  use_sdpa: true
+model:
+  is_causal: true
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+optimization:
+  ema:
+  - 0.99925
+  - 0.99925
+  epochs: 60 # checkpoint is at epoch 50 + 10 epochs for this training
+  final_lr: 0.000525
+  final_weight_decay: 0.04
+  ipe_scale: 1.25
+  lr: 0.000525
+  start_lr: 0.0001
+  warmup: 40
+  weight_decay: 0.04

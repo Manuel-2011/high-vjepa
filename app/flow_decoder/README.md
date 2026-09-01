@@ -123,7 +123,7 @@ python -m app.flow_decoder.latent_cache \
     --model-name "V-JEPA2 (baseline)" \
     --output-dir data/flow_decoder_shards/vjepa2-baseline/train \
     --dataset-csv data/ek55_4fps_train.csv \
-    --num-clips 512 --targets-per-clip 6 --store-predictor-latents
+    --num-clips 512 --targets-per-clip 6
 
 python -m app.flow_decoder.latent_cache \
     --model-name "V-JEPA2 (baseline)" \

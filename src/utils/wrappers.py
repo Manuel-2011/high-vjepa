@@ -34,9 +34,14 @@ class PredictorMultiSeqWrapper(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, x, masks_x=None, masks_y=None, has_cls=False, is_causal=False):
+    def forward(self, x, masks_x=None, masks_y=None, has_cls=False, is_causal=False, guidance=None):
+        """
+        :param guidance: [list] one guidance tensor per input sequence (or None)
+        """
         if is_causal:
-            return [self.backbone(xi, has_cls=has_cls) for xi in x]
+            if guidance is None:
+                guidance = [None] * len(x)
+            return [self.backbone(xi, has_cls=has_cls, guidance=gi) for xi, gi in zip(x, guidance)]
         
         n = 0
         outs = [[] for _ in x]        

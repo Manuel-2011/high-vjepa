@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from src.masks.utils import apply_masks
-from src.models.utils.modules import Block
+from src.models.utils.modules import Block, GuidedBlock
 from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 
@@ -48,12 +48,26 @@ class VisionTransformerPredictor(nn.Module):
         chop_last_n_tokens=0,
         use_rope=False,
         is_causal=False,
+        use_guidance=False,
+        guidance_dim=None,
+        guidance_gate_init=0.0,
+        guidance_step_ratio=4,
+        guidance_window=None,
         **kwargs
     ):
         super().__init__()
         self.return_all_tokens = return_all_tokens
         self.chop_last_n_tokens = chop_last_n_tokens
         self.is_causal = is_causal
+        # -- cross-attention to a frozen, longer-horizon world model
+        self.use_guidance = use_guidance
+        self.guidance_dim = embed_dim if guidance_dim is None else guidance_dim
+        # How many steps of *this* model fit in one step of the guidance model, e.g. a
+        # 0.5fps guidance model steps 2s at a time while a 4fps model (tubelet 2) steps
+        # 0.5s at a time, so guidance_step_ratio == 4.
+        self.guidance_step_ratio = guidance_step_ratio
+        # Number of most-recent guidance steps a token may read (None -> every past one)
+        self.guidance_window = guidance_window
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -101,9 +115,15 @@ class VisionTransformerPredictor(nn.Module):
 
         # Attention Blocks
         self.use_rope = use_rope
+        if use_guidance:
+            assert use_rope, "Guidance cross-attention is defined in terms of RoPE positions"
+            assert is_causal, "Guidance cross-attention is only defined for the causal predictor"
+            block_fn = partial(GuidedBlock, guidance_gate_init=guidance_gate_init)
+        else:
+            block_fn = Block
         self.predictor_blocks = nn.ModuleList(
             [
-                Block(
+                block_fn(
                     use_rope=use_rope,
                     grid_size=self.grid_height,
                     grid_depth=self.grid_depth,
@@ -134,6 +154,13 @@ class VisionTransformerPredictor(nn.Module):
         # Normalize & project back to input dimension
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, out_embed_dim, bias=True)
+
+        # Project the guidance model's latents (which live in *its* encoder's feature
+        # space, e.g. 1024-d for a ViT-L) into this predictor's width. Shared by every
+        # block so the projection is paid once per step.
+        if use_guidance:
+            self.guidance_norm = norm_layer(self.guidance_dim)
+            self.guidance_proj = nn.Linear(self.guidance_dim, predictor_embed_dim, bias=True)
 
         # ------ initialize weights
         if self.predictor_pos_embed is not None:
@@ -174,11 +201,68 @@ class VisionTransformerPredictor(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def forward(self, x, masks_x=None, masks_y=None, mask_index=1, has_cls=False):
+    def build_guidance_positions(self, num_steps, num_guidance_steps, device):
+        """Place this predictor's tokens and the guidance model's tokens on one shared
+        (time, height, width) grid, and say which of the latter each of the former may read.
+
+        Time is measured in units of *this* model's step (e.g. 0.5s for a 4fps model with
+        tubelet 2), and a token's time coordinate is the time of the frame it *predicts*:
+
+          - token `s` of this predictor has seen tubelets 0..s and predicts tubelet s+1,
+            so its coordinate is `s + 1`;
+          - guidance token `l` has seen guidance tubelets 0..l -- i.e. up to time
+            `R * l` on this axis -- and predicts guidance tubelet l+1, so its coordinate
+            is `R * (l + 1)`, with `R = guidance_step_ratio`.
+
+        The rotation therefore sees exactly the gap between the two prediction horizons:
+        a token predicting 0.5s ahead that reads a guidance token predicting 2s ahead
+        gets a relative offset of 3 steps.
+
+        Causality is preserved by only letting token `s` read guidance token `l` when the
+        guidance model's *context* ends no later than this model's, i.e. `R * l <= s`.
+        Guidance latents are predictions rather than observations, so nothing about the
+        future leaks as long as that holds.
+
+        :return: (q_pos, k_pos, xattn_mask)
+        """
+        P = self.grid_height * self.grid_width
+        R = self.guidance_step_ratio
+
+        # -- spatial coordinates, identical layout for both sides
+        patch_ids = torch.arange(P, device=device)
+        patch_h = (patch_ids // self.grid_width).float()
+        patch_w = (patch_ids % self.grid_width).float()
+
+        step_ids = torch.arange(num_steps, device=device)
+        q_step = step_ids.repeat_interleave(P)
+        q_pos = (
+            (q_step + 1).float(),
+            patch_h.repeat(num_steps),
+            patch_w.repeat(num_steps),
+        )
+
+        guidance_ids = torch.arange(num_guidance_steps, device=device)
+        k_step = guidance_ids.repeat_interleave(P)
+        k_pos = (
+            ((k_step + 1) * R).float(),
+            patch_h.repeat(num_guidance_steps),
+            patch_w.repeat(num_guidance_steps),
+        )
+
+        # -- [N_q, N_k] bool mask, True where the guidance token is readable
+        lag = q_step.unsqueeze(1) - R * k_step.unsqueeze(0)
+        xattn_mask = lag >= 0
+        if self.guidance_window is not None:
+            xattn_mask = xattn_mask & (lag < R * self.guidance_window)
+        return q_pos, k_pos, xattn_mask
+
+    def forward(self, x, masks_x=None, masks_y=None, mask_index=1, has_cls=False, guidance=None):
         """
         :param x: context tokens
         :param masks_x: indices of context tokens in input
         :params masks_y: indices of target tokens in input
+        :param guidance: [B, num_guidance_steps * num_patches_per_frame, guidance_dim]
+            latents predicted by a frozen, longer-horizon world model
         """
         if not self.is_causal:
             assert (masks_x is not None) and (masks_y is not None), "Cannot run predictor without mask indices"
@@ -240,12 +324,34 @@ class VisionTransformerPredictor(nn.Module):
         if has_cls:
             x = torch.cat([x_cls, x], dim=1)
 
+        # Prepare guidance tokens and the space-time coordinates the cross-attention
+        # rotates queries and keys with
+        q_pos = k_pos = xattn_mask = None
+        if guidance is not None:
+            assert self.use_guidance, "Predictor was not built with use_guidance=True"
+            P = self.grid_height * self.grid_width
+            assert x.size(1) % P == 0, f"{x.size(1)} predictor tokens is not a whole number of frames"
+            assert guidance.size(1) % P == 0, (
+                f"{guidance.size(1)} guidance tokens is not a whole number of frames; the guidance model "
+                "must use the same spatial grid as this predictor"
+            )
+            q_pos, k_pos, xattn_mask = self.build_guidance_positions(
+                num_steps=x.size(1) // P, num_guidance_steps=guidance.size(1) // P, device=x.device
+            )
+            guidance = self.guidance_proj(self.guidance_norm(guidance))
+
+        blk_kwargs = {}
+        if guidance is not None:
+            blk_kwargs = dict(guidance=guidance, q_pos=q_pos, k_pos=k_pos, xattn_mask=xattn_mask)
+
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(blk, x, None if self.is_causal else masks, None, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(
+                    blk, x, None if self.is_causal else masks, None, use_reentrant=False, **blk_kwargs
+                )
             else:
-                x = blk(x, mask=None if self.is_causal else masks, attn_mask=None)
+                x = blk(x, mask=None if self.is_causal else masks, attn_mask=None, **blk_kwargs)
         x = self.predictor_norm(x)
 
         if has_cls:
