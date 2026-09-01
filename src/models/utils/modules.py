@@ -297,7 +297,11 @@ class RoPEAttention(nn.Module):
         P = self.grid_size * self.grid_size
         temporal_mask = torch.tril(torch.ones(grid_depth, grid_depth))
         patch_mask = torch.ones(P, P)
-        temp_attn_mask = torch.kron(temporal_mask, patch_mask)
+        # NOTE: this must be a *bool* mask. F.scaled_dot_product_attention treats a bool
+        # attn_mask as "True = attend" but *adds* a float mask to the scores, so a float
+        # {0, 1} mask leaves every disallowed position fully visible (and biases the
+        # allowed ones by +1) -- i.e. no causal masking at all.
+        temp_attn_mask = torch.kron(temporal_mask, patch_mask).bool()
         self.register_buffer('temp_attn_mask', temp_attn_mask)
 
     def _get_frame_pos(self, ids, H_patches=None, W_patches=None):
@@ -390,8 +394,10 @@ class RoPEAttention(nn.Module):
             current_patches_num = grid_depth * self.grid_size * self.grid_size
             causal_attn_mask = self.temp_attn_mask[:current_patches_num,:current_patches_num]
             if attn_mask is not None:
-                causal_attn_mask = causal_attn_mask.view((1,) * (attn_mask.dim() - causal_attn_mask.dim()) + causal_attn_mask.shape).to(attn_mask.dtype) # Make the casusal mask have the same number of dims as attn_mask
-                causal_attn_mask = attn_mask * causal_attn_mask
+                if attn_mask.dtype == torch.bool:
+                    causal_attn_mask = attn_mask & causal_attn_mask
+                else:  # additive mask: -inf out whatever the causal mask forbids
+                    causal_attn_mask = attn_mask.masked_fill(~causal_attn_mask, float("-inf"))
             
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(
@@ -638,3 +644,149 @@ class CrossAttentionBlock(nn.Module):
         q = q + y
         q = q + self.mlp(self.norm2(q))
         return q
+
+
+class CrossRoPEAttention(nn.Module):
+    """Cross-attention with 3D RoPE applied to both queries and keys.
+
+    Unlike `CrossAttention`, queries and keys are placed on a *shared* (time, height,
+    width) coordinate system, so the rotation encodes how far apart a query token is
+    from the memory token it reads -- both in space and in prediction horizon. This
+    is what lets a short-horizon world-model step (e.g. predicting 0.5s ahead) know
+    that the guidance token it attends to is a prediction 2s ahead.
+
+    Positions are passed in as `(depth, height, width)` triplets of 1D float tensors,
+    one entry per token, and are expected to already be expressed in a common unit
+    (see `VisionTransformerPredictor` for how they are built).
+    """
+
+    def __init__(
+        self,
+        dim,
+        kv_dim=None,
+        num_heads=8,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        use_sdpa=True,
+    ):
+        super().__init__()
+        kv_dim = dim if kv_dim is None else kv_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(kv_dim, int(2 * dim), bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop_prob = proj_drop
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.use_sdpa = use_sdpa
+        # -- same head-dim split as RoPEAttention: a third of the head for each axis
+        self.d_dim = int(2 * ((head_dim // 3) // 2))
+        self.h_dim = int(2 * ((head_dim // 3) // 2))
+        self.w_dim = int(2 * ((head_dim // 3) // 2))
+
+    def _rotate(self, t, pos):
+        d_pos, h_pos, w_pos = pos
+        s = 0
+        td = rotate_queries_or_keys(t[..., s : s + self.d_dim], pos=d_pos)
+        s += self.d_dim
+        th = rotate_queries_or_keys(t[..., s : s + self.h_dim], pos=h_pos)
+        s += self.h_dim
+        tw = rotate_queries_or_keys(t[..., s : s + self.w_dim], pos=w_pos)
+        s += self.w_dim
+        if s < self.head_dim:
+            return torch.cat([td, th, tw, t[..., s:]], dim=-1)
+        return torch.cat([td, th, tw], dim=-1)
+
+    def forward(self, x, mem, q_pos, k_pos, attn_mask=None):
+        """
+        :param x: [B, N, dim] query tokens
+        :param mem: [B, M, kv_dim] memory (guidance) tokens
+        :param q_pos: triplet of [N] float tensors with the (t, h, w) position of each query
+        :param k_pos: triplet of [M] float tensors with the (t, h, w) position of each memory token
+        :param attn_mask: [N, M] bool tensor, True where a query may read a memory token
+        """
+        B, N, C = x.shape
+
+        q = self.q(x).unflatten(-1, (self.num_heads, -1)).permute(0, 2, 1, 3)  # [B, heads, N, D]
+        kv = self.kv(mem).unflatten(-1, (2, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]  # [B, heads, M, D]
+
+        q = self._rotate(q, q_pos)
+        k = self._rotate(k, k_pos)
+
+        if self.use_sdpa:
+            with torch.backends.cuda.sdp_kernel():
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, N, M]
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    attn = attn.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    attn = attn + attn_mask
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class GuidedBlock(Block):
+    """`Block` with an extra RoPE cross-attention branch reading from a frozen
+    guidance model's predicted latents.
+
+    Self-attention, MLP and norm parameters keep the exact names they have in `Block`,
+    so a checkpoint of an un-guided predictor loads into a guided one and only the new
+    cross-attention parameters come up missing. The cross-attention residual is scaled
+    by a per-channel gate that is zero-initialized by default, so at initialization the
+    guided model is *exactly* the model it was initialized from and it has to learn to
+    open the gate.
+    """
+
+    def __init__(self, dim, num_heads, guidance_gate_init=0.0, **kwargs):
+        super().__init__(dim, num_heads, **kwargs)
+        norm_layer = kwargs.get("norm_layer", nn.LayerNorm)
+        self.norm_xattn = norm_layer(dim)
+        # Guidance latents are projected to `dim` once per step by the predictor
+        # (`guidance_proj`), so every block reads them at its own width.
+        self.xattn = CrossRoPEAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=kwargs.get("qkv_bias", False),
+            qk_scale=kwargs.get("qk_scale", None),
+            attn_drop=kwargs.get("attn_drop", 0.0),
+            proj_drop=kwargs.get("drop", 0.0),
+            use_sdpa=kwargs.get("use_sdpa", True),
+        )
+        self.gamma_xattn = nn.Parameter(guidance_gate_init * torch.ones(dim))
+
+    def forward(
+        self,
+        x,
+        mask=None,
+        attn_mask=None,
+        T=None,
+        H_patches=None,
+        W_patches=None,
+        guidance=None,
+        q_pos=None,
+        k_pos=None,
+        xattn_mask=None,
+    ):
+        if isinstance(self.attn, RoPEAttention):
+            y = self.attn(self.norm1(x), mask=mask, attn_mask=attn_mask, T=T, H_patches=H_patches, W_patches=W_patches)
+        else:
+            y = self.attn(self.norm1(x), mask=mask, attn_mask=attn_mask)
+        x = x + self.drop_path(y)
+        if guidance is not None:
+            y = self.xattn(self.norm_xattn(x), guidance, q_pos=q_pos, k_pos=k_pos, attn_mask=xattn_mask)
+            x = x + self.drop_path(self.gamma_xattn * y)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
