@@ -5,19 +5,23 @@ cpus_per_task: 16
 mem_per_gpu: 40G
 folder: preliminary_experiments/EK100-world-model-goal-256px
 data:
-  dataset_type: VideoDataset
+  # Directories are walked recursively for videos; .csv manifests and single files also
+  # work. Every window of every video is a sample (see world_model.window_stride_chunks),
+  # so the mixture is proportional to footage duration -- no per-dataset weights.
   datasets:
-  - data/EK100_pretraining.csv
-  datasets_weights:
-  - 1.0
+  - data/ek55_processed/train
+  - data/ek100-processed
+  # Caches each video's length and frame rate so the collection is only probed once.
+  index_cache: data/wm_window_index.json
+  # Fill each batch from that many different videos. Windows of one video overlap and
+  # are highly correlated, so batching them together wastes the batch.
+  distinct_videos_per_batch: true
   batch_size: 2
   crop_size: 256
   fps: 4
   num_workers: 8
   persistent_workers: true
   pin_mem: true
-  # dataset_fpcs is derived from the world_model section (136 frames = 34s at 4fps);
-  # set it here only if you want the training script to check your arithmetic.
 data_aug:
   auto_augment: false
   motion_shift: false
@@ -60,6 +64,10 @@ world_model:
   # also learns to roll forward unconditionally instead of leaning on the goal for
   # everything. Set to 0 to always condition.
   goal_drop_prob: 0.1
+  # Hop between consecutive windows of a video, in chunks. The default (context_chunks
+  # + 1 = 9 chunks = 18s) is exactly the span the model is trained on, so the windows
+  # of a video tile its footage with no gaps and no repeats. Lower it to oversample.
+  window_stride_chunks: 9
 model:
   embed_dim: 768
   enc_depth: 6

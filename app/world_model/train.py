@@ -51,8 +51,7 @@ from app.world_model.utils import (
     load_checkpoint,
     split_into_chunks,
 )
-from src.datasets.data_manager import init_data
-from src.masks.multiseq_multiblock3d import SimpleCollator
+from src.datasets.video_window_dataset import make_videowindowdataset
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 
@@ -110,6 +109,11 @@ def main(args, resume_preempt=False):
     goal_min_seconds = float(cfgs_wm.get("goal_min_seconds", 4.0))
     goal_max_seconds = float(cfgs_wm.get("goal_max_seconds", 16.0))
     goal_drop_prob = float(cfgs_wm.get("goal_drop_prob", 0.1))
+    # Hop between consecutive windows of a video, in chunks. The default is the span the
+    # model is actually trained on (context + the last predicted chunk), so successive
+    # windows tile every video's footage with no gaps and no repeats; the rest of a
+    # window exists only to hold the goal.
+    window_stride_chunks = cfgs_wm.get("window_stride_chunks", context_chunks + 1)
 
     # -- MODEL
     cfgs_model = args.get("model")
@@ -130,11 +134,11 @@ def main(args, resume_preempt=False):
 
     # -- DATA
     cfgs_data = args.get("data")
-    dataset_type = cfgs_data.get("dataset_type", "videodataset")
+    # Directories of videos, individual files, or .csv manifests -- all of them are
+    # walked end to end, so the mixture is simply proportional to footage duration.
     dataset_paths = cfgs_data.get("datasets", [])
-    datasets_weights = cfgs_data.get("datasets_weights")
-    if datasets_weights is not None:
-        assert len(datasets_weights) == len(dataset_paths), "Must have one sampling weight specified for each dataset"
+    index_cache = cfgs_data.get("index_cache", None)
+    distinct_videos_per_batch = cfgs_data.get("distinct_videos_per_batch", True)
     batch_size = cfgs_data.get("batch_size")
     fps = cfgs_data.get("fps")
     crop_size = cfgs_data.get("crop_size", 256)
@@ -188,12 +192,8 @@ def main(args, resume_preempt=False):
     assert goal_max_frames >= goal_min_frames, "goal_max_seconds must be >= goal_min_seconds"
     assert 0.0 <= goal_drop_prob < 1.0, "goal_drop_prob must be in [0, 1)"
     assert crop_size % patch_size == 0, "crop size must be a whole number of patches"
-    cfg_fpcs = cfgs_data.get("dataset_fpcs", None)
-    assert cfg_fpcs is None or all(f == clip_frames for f in cfg_fpcs), (
-        f"dataset_fpcs {cfg_fpcs} does not match the {clip_frames} frames this configuration needs "
-        f"({context_chunks} context chunks of {frames_per_chunk} frames + a goal up to {goal_max_seconds}s away)"
-    )
-    dataset_fpcs = [clip_frames for _ in dataset_paths]
+    assert window_stride_chunks >= 1, "window_stride_chunks must be at least one chunk"
+    stride_frames = window_stride_chunks * frames_per_chunk
 
     grid_size = crop_size // patch_size
     patches_per_chunk = grid_size * grid_size
@@ -228,7 +228,8 @@ def main(args, resume_preempt=False):
         f"context: {context_chunks} chunks ({context_frames / fps:.1f}s) | "
         f"goal: {goal_min_seconds}-{goal_max_seconds}s past the context "
         f"({goal_min_frames}-{goal_max_frames} frames), dropped {goal_drop_prob:.0%} of the time | "
-        f"clip: {clip_frames} frames ({clip_frames / fps:.1f}s)"
+        f"clip: {clip_frames} frames ({clip_frames / fps:.1f}s) every "
+        f"{stride_frames} frames ({stride_frames / fps:.1f}s) of every video"
     )
 
     # -- set device
@@ -313,12 +314,6 @@ def main(args, resume_preempt=False):
         target_encoder.compile()
         predictor.compile()
 
-    collator = SimpleCollator(
-        dataset_fpcs=dataset_fpcs,
-        use_pretrained_model=False,
-        tubelet_size=tubelet_size,
-        patch_size=patch_size,
-    )
     transform = make_transforms(
         random_horizontal_flip=True,
         random_resize_aspect_ratio=ar_range,
@@ -330,27 +325,23 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
-    (unsupervised_loader, unsupervised_sampler) = init_data(
-        data=dataset_type,
-        root_path=dataset_paths,
+    (_, unsupervised_loader, unsupervised_sampler) = make_videowindowdataset(
+        data_paths=dataset_paths,
         batch_size=batch_size,
-        training=True,
-        dataset_fpcs=dataset_fpcs,
+        clip_frames=clip_frames,
+        stride_frames=stride_frames,
         fps=fps,
         transform=transform,
         rank=rank,
         world_size=world_size,
-        datasets_weights=datasets_weights,
+        seed=seed,
+        distinct_videos_per_batch=distinct_videos_per_batch,
+        index_cache=index_cache,
         persistent_workers=persistent_workers,
-        collator=collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
-        log_dir=None,
     )
-    try:
-        _dlen = len(unsupervised_loader)
-    except Exception:  # Different interface for webdataset
-        _dlen = unsupervised_loader.num_batches
+    _dlen = len(unsupervised_loader)
     if ipe is None:
         ipe = _dlen
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
@@ -407,7 +398,6 @@ def main(args, resume_preempt=False):
             scheduler.step()
             wd_scheduler.step()
             next(momentum_scheduler)
-            collator.step()
 
     def save_checkpoint(epoch, path):
         if rank != 0:
@@ -496,11 +486,8 @@ def main(args, resume_preempt=False):
                         logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
                         raise e
 
-            # Every dataset is served at the same clip length, so the collator groups the
-            # whole batch under a single frames-per-clip key.
-            assert len(sample) == 1, f"expected a single clip length, got {len(sample)}"
-            udata, _, _ = sample[0]
-            clip = udata[0][0].to(device, non_blocking=True)
+            # (clips, video index, first frame) -- the last two are only for debugging
+            clip = sample[0].to(device, non_blocking=True)
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
