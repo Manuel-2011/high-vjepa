@@ -11,7 +11,7 @@ import torch
 
 import src.models.predictor as vit_pred
 import src.models.vision_transformer as video_vit
-from app.vjepa.utils import RECOMPUTED_BUFFERS, MASK_TOKEN_KEY
+from app.vjepa.utils import load_module_state_dict
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
 
@@ -28,36 +28,6 @@ GUIDANCE_KEY = re.compile(r"(.*\.)?(xattn\..*|norm_xattn\..*|gamma_xattn|guidanc
 
 def _strip_ddp_prefix(state_dict):
     return {(k[len("module.") :] if k.startswith("module.") else k): v for k, v in state_dict.items()}
-
-
-def load_module_state_dict(module, pretrained_dict, tag, epoch, allow_missing=None):
-    """Same contract as `app.vjepa.utils.load_module_state_dict`, plus tolerance for keys
-    matching `allow_missing` (a compiled regex) being absent from the checkpoint."""
-    missing, unexpected = module.load_state_dict(pretrained_dict, strict=False)
-    recomputed = [k for k in missing + unexpected if k.endswith(RECOMPUTED_BUFFERS)]
-    missing = [k for k in missing if not k.endswith(RECOMPUTED_BUFFERS)]
-    unexpected = [k for k in unexpected if not k.endswith(RECOMPUTED_BUFFERS)]
-
-    newly_initialized = []
-    if allow_missing is not None:
-        newly_initialized = [k for k in missing if allow_missing.match(k)]
-        missing = [k for k in missing if k not in newly_initialized]
-
-    surplus_mask_tokens = [k for k in unexpected if MASK_TOKEN_KEY.match(k)]
-    unexpected = [k for k in unexpected if k not in surplus_mask_tokens]
-    if missing or unexpected:
-        raise RuntimeError(
-            f"Error(s) in loading state_dict for {tag}: missing keys {missing}, unexpected keys {unexpected}"
-        )
-    if surplus_mask_tokens:
-        logger.warning(f"{tag}: dropped {len(surplus_mask_tokens)} surplus mask token(s) from the checkpoint")
-    if newly_initialized:
-        logger.warning(
-            f"{tag}: {len(newly_initialized)} guidance cross-attention parameter(s) were not in the checkpoint "
-            "and are freshly initialized. This is expected when starting from an un-guided causal checkpoint; "
-            "it is NOT expected when resuming a guided run."
-        )
-    logger.info(f"loaded pretrained {tag} from epoch {epoch} ({len(recomputed)} recomputed buffer(s) ignored)")
 
 
 def load_checkpoint(r_path, encoder, predictor, target_encoder, opt, scaler, is_anneal=False):

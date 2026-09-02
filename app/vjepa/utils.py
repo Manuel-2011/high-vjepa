@@ -102,14 +102,33 @@ def build_eval_args(
     return eval_nodes, eval_tasks_per_node, args_eval
 
 
-def load_module_state_dict(module, pretrained_dict, tag, epoch):
+def load_module_state_dict(module, pretrained_dict, tag, epoch, allow_missing=None):
     """Load `pretrained_dict` into `module`, tolerating mismatches that only involve
     the buffers listed in RECOMPUTED_BUFFERS or surplus trailing mask tokens. Any
-    other missing/unexpected key is still an error, exactly as with a strict load."""
+    other missing/unexpected key is still an error, exactly as with a strict load.
+
+    :param allow_missing: optional compiled regex; keys the model has and the checkpoint
+        does not are permitted (and logged) when they match it. Used to initialize new
+        parameters -- e.g. guidance cross-attention -- from a checkpoint that predates them.
+    """
+    # Recomputed buffers must be dropped *before* the load, not filtered out of the
+    # result: their shape follows the model config (temp_attn_mask is (grid_depth * P)
+    # square), so a checkpoint trained on a different clip length carries a differently
+    # sized one -- and load_state_dict raises on a shape mismatch even with strict=False.
+    # The module built its own from its own config, which is the one that is correct here.
+    stale_buffers = [k for k in pretrained_dict if k.endswith(RECOMPUTED_BUFFERS)]
+    if stale_buffers:
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k not in stale_buffers}
+
     missing, unexpected = module.load_state_dict(pretrained_dict, strict=False)
-    recomputed = [k for k in missing + unexpected if k.endswith(RECOMPUTED_BUFFERS)]
+    recomputed = stale_buffers + [k for k in missing + unexpected if k.endswith(RECOMPUTED_BUFFERS)]
     missing = [k for k in missing if not k.endswith(RECOMPUTED_BUFFERS)]
     unexpected = [k for k in unexpected if not k.endswith(RECOMPUTED_BUFFERS)]
+
+    newly_initialized = []
+    if allow_missing is not None:
+        newly_initialized = [k for k in missing if allow_missing.match(k)]
+        missing = [k for k in missing if k not in newly_initialized]
     # Mask tokens are indexed, so the ones this model does have were already loaded
     # from their same-index counterpart in the checkpoint.
     surplus_mask_tokens = [k for k in unexpected if MASK_TOKEN_KEY.match(k)]
@@ -117,6 +136,11 @@ def load_module_state_dict(module, pretrained_dict, tag, epoch):
     if missing or unexpected:
         raise RuntimeError(
             f"Error(s) in loading state_dict for {tag}: missing keys {missing}, unexpected keys {unexpected}"
+        )
+    if newly_initialized:
+        logger.warning(
+            f"{tag}: {len(newly_initialized)} parameter(s) were not in the checkpoint and are freshly "
+            f"initialized, e.g. {newly_initialized[:3]}"
         )
     if surplus_mask_tokens:
         logger.warning(
