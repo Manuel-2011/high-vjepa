@@ -1,0 +1,90 @@
+app: world_model
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: preliminary_experiments/EK100-world-model-goal-256px
+data:
+  dataset_type: VideoDataset
+  datasets:
+  - data/EK100_pretraining.csv
+  datasets_weights:
+  - 1.0
+  batch_size: 2
+  crop_size: 256
+  fps: 4
+  num_workers: 8
+  persistent_workers: true
+  pin_mem: true
+  # dataset_fpcs is derived from the world_model section (136 frames = 34s at 4fps);
+  # set it here only if you want the training script to check your arithmetic.
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+meta:
+  dtype: bfloat16
+  load_checkpoint: true
+  read_checkpoint: null
+  save_every_freq: 10
+  seed: 239
+  use_sdpa: true
+vjepa:
+  # Frozen V-JEPA 2 encoder: the world model never trains it, it only reads its tokens.
+  checkpoint: models/vitl.pt
+  checkpoint_key: target_encoder
+  model_name: vit_large
+  patch_size: 16
+  tubelet_size: 2
+  uniform_power: false
+  use_rope: true
+  # Chunks per frozen forward pass (-1 = all of them at once). Lower it to trade
+  # speed for memory; it does not change the result.
+  batch_size: -1
+world_model:
+  # One chunk = 4 V-JEPA temporal tokens = 8 frames = 2s at 4fps.
+  tokens_per_chunk: 4
+  context_chunks: 8
+  # The goal chunk starts uniformly between 4s and 16s past the end of the context.
+  goal_min_seconds: 4.0
+  goal_max_seconds: 16.0
+  # Fraction of samples whose goal is replaced by a learned null goal, so the predictor
+  # also learns to roll forward unconditionally instead of leaning on the goal for
+  # everything. Set to 0 to always condition.
+  goal_drop_prob: 0.1
+model:
+  embed_dim: 768
+  enc_depth: 6
+  enc_num_heads: 12
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  # Per-channel gate on the goal cross-attention branch. Unlike a run that adapts a
+  # pretrained un-conditioned predictor, this model is trained from scratch, so the
+  # gate opens at 1.0 and the goal is used from the first step.
+  goal_gate_init: 1.0
+  # Width of the sinusoidal "time left to reach the goal" embedding.
+  horizon_embed_dim: 128
+  drop_path_rate: 0.0
+  use_activation_checkpointing: true
+optimization:
+  ema:
+  - 0.998
+  - 0.9999
+  epochs: 100
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: null
+  ipe_scale: 1.25
+  lr: 0.0005
+  start_lr: 0.0002
+  warmup: 5
+  weight_decay: 0.04
