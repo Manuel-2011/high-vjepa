@@ -7,6 +7,7 @@ import logging
 import sys
 
 import torch
+import torch.nn as nn
 
 import src.models.vision_transformer as video_vit
 from app.vjepa.utils import load_module_state_dict
@@ -203,3 +204,67 @@ def gather_window(clip, starts, num_frames):
     assert int(idx.max()) < T, f"goal window runs past the end of a {T}-frame clip"
     idx = idx.view(B, 1, num_frames, 1, 1).expand(B, C, num_frames, H, W)
     return torch.gather(clip, 2, idx)
+
+
+class ChunkWindowEncoder(nn.Module):
+    """Frozen V-JEPA 2 backbone + trained chunk encoder, over a window of whole chunks.
+
+    Presents the pair as one encoder with the interface the rest of the repo expects --
+    `[B, C, T, H, W]` pixels in, `[B, num_chunks * P, embed_dim]` chunk latents out --
+    so a whole window can be embedded in a single call. Chunks are pushed through the
+    frozen backbone one at a time, exactly as in training: its attention is
+    bidirectional, so encoding several chunks together would let one chunk's features
+    see another's future.
+
+    :param backbone_batch_size: chunks per frozen forward pass (-1 = all at once).
+        Trades memory for speed and changes nothing about the result.
+    """
+
+    def __init__(self, vjepa, encoder, frames_per_chunk, backbone_batch_size=-1):
+        super().__init__()
+        self.vjepa = vjepa
+        self.encoder = encoder
+        self.frames_per_chunk = frames_per_chunk
+        self.backbone_batch_size = backbone_batch_size
+        self.embed_dim = encoder.embed_dim
+
+    def forward(self, clip):
+        B, _, T, _, _ = clip.shape
+        assert T % self.frames_per_chunk == 0, (
+            f"a {T}-frame clip is not a whole number of {self.frames_per_chunk}-frame chunks"
+        )
+        num_chunks = T // self.frames_per_chunk
+        chunks = split_into_chunks(clip, self.frames_per_chunk, num_chunks)
+        step = self.backbone_batch_size if self.backbone_batch_size > 0 else chunks.size(0)
+        feats = torch.cat(
+            [self.vjepa(chunks[i : i + step]) for i in range(0, chunks.size(0), step)], dim=0
+        )
+        z = self.encoder(feats)  # [B * num_chunks, P, embed_dim]
+        return z.reshape(B, num_chunks * z.size(1), z.size(2))
+
+
+class GoalFreePredictor(nn.Module):
+    """`GoalConditionedPredictor` run with its goal branch switched off.
+
+    Every sample takes the learned null goal and null horizon -- the path
+    `goal_drop_prob` trains -- so the predictor is asked to roll the world forward with
+    no intention supplied. Use it to compare against world models that have no goal
+    input at all, which would otherwise be given strictly less information.
+
+    A goal tensor and position are still passed to the wrapped predictor because its
+    signature requires them, but they are inert: with `keep_goal` all False the null
+    token is broadcast to every key of the cross-attention, so its output is that token
+    whatever the goal or its position says.
+    """
+
+    def __init__(self, predictor):
+        super().__init__()
+        self.predictor = predictor
+
+    def forward(self, x, has_cls=False, **kwargs):
+        assert not has_cls, "the chunk predictor has no cls token"
+        batch_size = x.size(0)
+        goal = x.new_zeros(batch_size, self.predictor.patches_per_chunk, self.predictor.embed_dim)
+        goal_pos = x.new_zeros(batch_size)
+        keep_goal = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+        return self.predictor(x, goal=goal, goal_pos=goal_pos, keep_goal=keep_goal)

@@ -74,6 +74,12 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.vjepa.utils import init_video_model, load_module_state_dict
+from app.world_model.utils import (
+    ChunkWindowEncoder,
+    GoalFreePredictor,
+    init_frozen_backbone,
+    init_world_model,
+)
 from evals.generate_patch_embedding_report import (
     DEFAULT_NORMALIZATION,
     MODELS_CONFIG,
@@ -85,8 +91,29 @@ from evals.generate_patch_embedding_report import (
 )
 from evals.video_classification_frozen.utils import make_transforms
 from src.utils.checkpoint_loader import robust_checkpoint_loader
+from src.utils.wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
 
 logger = logging.getLogger(__name__)
+
+# World models whose autoregressive unit is not a V-JEPA tubelet, and which therefore
+# need their own geometry and loader. `kind` selects both; entries in the shared
+# MODELS_CONFIG carry no `kind` and are read as plain V-JEPA world models.
+#
+# The goal-guided model is rolled out with its **goal withheld** (the learned null goal,
+# i.e. the unconditional path `world_model.goal_drop_prob` trains). Told where it is
+# going it would be solving a strictly easier problem than every other model here, and
+# the comparison would say nothing. What this measures is whether learning *with* a goal
+# produced a better world model, not whether a goal helps at inference.
+EXTRA_MODELS_CONFIG = [
+    {
+        "name": "Goal-guided world model (goal withheld)",
+        "checkpoint": "preliminary_experiments/EK100-world-model-goal-256px/latest.pt",
+        "config": "configs/train/vitl16-EK100/world-model-goal-256px.yaml",
+        "kind": "goal_world_model",
+    },
+]
+
+ALL_MODELS_CONFIG = list(MODELS_CONFIG) + EXTRA_MODELS_CONFIG
 
 # Distances between a predicted frame embedding and its ground truth. Each is
 # reported three ways: `_pred` (prediction vs ground truth), `_ref` (the
@@ -409,6 +436,74 @@ def build_geometry(config: dict, horizon_seconds: float) -> RolloutGeometry:
     )
 
 
+def build_goal_world_model_geometry(config: dict, horizon_seconds: float) -> RolloutGeometry:
+    """`build_geometry` for the goal-guided chunk world model.
+
+    Its autoregressive unit is a *chunk* -- `world_model.tokens_per_chunk` V-JEPA
+    temporal tokens, so 4 x 2 = 8 frames = 2s at 4 fps -- not a single tubelet. That is
+    the only structural difference: a chunk latent occupies one temporal slot of `P`
+    patch tokens exactly as a tubelet embedding does for the other models, so the whole
+    rollout, including `temporal_slice` and the persistence baseline, carries over
+    unchanged with `tubelet_size` read as "frames per temporal unit".
+
+    A step therefore advances 2s instead of 0.5s, and a fixed horizon takes four times
+    fewer steps. That is a real property of the architecture, not a handicap given to it
+    here: the report indexes every curve by lead time in seconds for this reason.
+    """
+    cfgs_data = config["data"]
+    cfgs_wm = config["world_model"]
+    cfgs_vjepa = config["vjepa"]
+
+    fps = float(cfgs_data["fps"])
+    crop_size = int(cfgs_data.get("crop_size", 256))
+    patch_size = int(cfgs_vjepa.get("patch_size", 16))
+    tubelet_size = int(cfgs_vjepa.get("tubelet_size", 2))
+    tokens_per_chunk = int(cfgs_wm.get("tokens_per_chunk", 4))
+    context_chunks = int(cfgs_wm.get("context_chunks", 8))
+
+    if crop_size % patch_size != 0:
+        raise ValueError(f"crop_size ({crop_size}) is not a multiple of patch_size ({patch_size}).")
+    if context_chunks < 1:
+        raise ValueError(f"context_chunks ({context_chunks}) leaves no past to predict from.")
+
+    grid = crop_size // patch_size
+    frames_per_chunk = tokens_per_chunk * tubelet_size
+    # One chunk beyond the context is the prediction slot, matching the convention the
+    # V-JEPA geometry uses (context_tokens = window_tokens - 1).
+    window_tokens = context_chunks + 1
+    step_seconds = frames_per_chunk / fps
+    num_steps = max(1, int(round(horizon_seconds / step_seconds)))
+
+    return RolloutGeometry(
+        fps=fps,
+        sampling_fps=fps,
+        # The temporal unit is a chunk, so "frames grouped into one temporal token" is
+        # the whole chunk. Every derived duration on RolloutGeometry then describes
+        # chunks, which is what the rollout advances by.
+        tubelet_size=frames_per_chunk,
+        frames_per_token=frames_per_chunk,
+        frames_to_skip=1,
+        patch_size=patch_size,
+        crop_size=crop_size,
+        frames_per_clip=window_tokens * frames_per_chunk,
+        spatial_tokens=grid * grid,
+        window_tokens=window_tokens,
+        context_tokens=context_chunks,
+        num_steps=num_steps,
+        is_causal=True,
+        uses_pretrained_backbone=False,
+    )
+
+
+def build_geometry_for(model_cfg: dict, config: dict, horizon_seconds: float) -> RolloutGeometry:
+    kind = model_cfg.get("kind", "vjepa")
+    if kind == "goal_world_model":
+        return build_goal_world_model_geometry(config, horizon_seconds)
+    if kind != "vjepa":
+        raise ValueError(f"unknown model kind {kind!r}")
+    return build_geometry(config, horizon_seconds)
+
+
 def resolve_checkpoint(model_cfg: dict, config: dict) -> str:
     checkpoint = model_cfg.get("checkpoint") or os.path.join(config["folder"], "latest.pt")
     if not os.path.exists(checkpoint):
@@ -485,6 +580,131 @@ def prepare_world_model(config: dict, checkpoint_path: str, device: str) -> Mode
         embed_dim=int(encoder.embed_dim),
         epoch=epoch,
     )
+
+
+def prepare_goal_world_model(config: dict, checkpoint_path: str, device: str) -> ModelBundle:
+    """Rebuild the goal-guided chunk world model and dress it in the same interface
+    `rollout_clips` uses for a V-JEPA world model.
+
+    Two shims do the work, both from `app/world_model/utils.py`:
+      * `ChunkWindowEncoder` fuses the frozen V-JEPA 2 backbone with the trained chunk
+        encoder, so a window of pixels maps straight to a window of chunk latents - one
+        temporal slot of `P` tokens per chunk, the same layout a tubelet embedding has.
+      * `GoalFreePredictor` runs the predictor on its null-goal path, so the rollout is
+        given exactly the information every other model gets: the past, and nothing else.
+
+    Both are then wrapped in the repo's `MultiSeqWrapper`/`PredictorMultiSeqWrapper`, so
+    the returned bundle is structurally identical to `prepare_world_model`'s and the
+    rollout does not have to know which kind of model it is driving.
+
+    The frozen backbone is shared between the online and target encoders rather than
+    duplicated - it is frozen and identical in both, and a second ViT-L would cost a
+    gigabyte for nothing.
+    """
+    cfgs_data = config["data"]
+    cfgs_model = config["model"]
+    cfgs_meta = config.get("meta", {})
+    cfgs_wm = config["world_model"]
+    cfgs_vjepa = config["vjepa"]
+
+    # Rolling out with the goal withheld exercises the null-goal path. If the run never
+    # dropped its goal, those parameters are still at their zero initialization and the
+    # model has never once been asked to predict without an intention - the numbers
+    # would be measuring an untrained code path, not a world model.
+    goal_drop_prob = float(cfgs_wm.get("goal_drop_prob", 0.0))
+    if goal_drop_prob <= 0.0:
+        raise ValueError(
+            "this model was trained with world_model.goal_drop_prob = 0, so its null goal was never "
+            "trained and it has never predicted without a goal; rolling it out unconditionally would "
+            "measure an untrained path. Retrain with goal_drop_prob > 0 to make it comparable."
+        )
+
+    crop_size = int(cfgs_data.get("crop_size", 256))
+    patch_size = int(cfgs_vjepa.get("patch_size", 16))
+    tubelet_size = int(cfgs_vjepa.get("tubelet_size", 2))
+    tokens_per_chunk = int(cfgs_wm.get("tokens_per_chunk", 4))
+    frames_per_chunk = tokens_per_chunk * tubelet_size
+    grid = crop_size // patch_size
+
+    vjepa = init_frozen_backbone(
+        device=device,
+        checkpoint=cfgs_vjepa["checkpoint"],
+        checkpoint_key=cfgs_vjepa.get("checkpoint_key", "target_encoder"),
+        model_name=cfgs_vjepa.get("model_name", "vit_large"),
+        crop_size=crop_size,
+        patch_size=patch_size,
+        tubelet_size=tubelet_size,
+        frames_per_chunk=frames_per_chunk,
+        uniform_power=cfgs_vjepa.get("uniform_power", False),
+        use_rope=cfgs_vjepa.get("use_rope", True),
+        use_sdpa=cfgs_meta.get("use_sdpa", False),
+        use_silu=cfgs_vjepa.get("use_silu", False),
+        wide_silu=cfgs_vjepa.get("wide_silu", True),
+    )
+
+    encoder, predictor = init_world_model(
+        device=device,
+        frozen_dim=vjepa.embed_dim,
+        grid_height=grid,
+        grid_width=grid,
+        tokens_per_chunk=tokens_per_chunk,
+        context_chunks=int(cfgs_wm.get("context_chunks", 8)),
+        embed_dim=cfgs_model.get("embed_dim", 768),
+        enc_depth=cfgs_model.get("enc_depth", 6),
+        enc_num_heads=cfgs_model.get("enc_num_heads", 12),
+        pred_depth=cfgs_model.get("pred_depth", 12),
+        pred_embed_dim=cfgs_model.get("pred_embed_dim", 384),
+        pred_num_heads=cfgs_model.get("pred_num_heads", 12),
+        goal_gate_init=cfgs_model.get("goal_gate_init", 1.0),
+        horizon_embed_dim=cfgs_model.get("horizon_embed_dim", 128),
+        use_sdpa=cfgs_meta.get("use_sdpa", False),
+        use_silu=cfgs_model.get("use_silu", False),
+        use_pred_silu=cfgs_model.get("use_pred_silu", False),
+        wide_silu=cfgs_model.get("wide_silu", True),
+        # Only trades compute for training memory; buys nothing under torch.no_grad().
+        use_activation_checkpointing=False,
+    )
+    target_encoder = copy.deepcopy(encoder)
+
+    # Load into the bare modules, before any wrapping, so the checkpoint's keys line up
+    # with what training saved.
+    checkpoint = robust_checkpoint_loader(checkpoint_path, map_location=torch.device("cpu"))
+    epoch = int(checkpoint.get("epoch", 0))
+    load_module_state_dict(encoder, strip_ddp_prefix(checkpoint["encoder"]), "chunk encoder", epoch)
+    load_module_state_dict(predictor, strip_ddp_prefix(checkpoint["predictor"]), "predictor", epoch)
+    load_module_state_dict(
+        target_encoder, strip_ddp_prefix(checkpoint["target_encoder"]), "target chunk encoder", epoch
+    )
+    del checkpoint
+
+    backbone_batch_size = int(cfgs_vjepa.get("batch_size", -1))
+    bundled = ModelBundle(
+        encoder=MultiSeqWrapper(
+            ChunkWindowEncoder(vjepa, encoder, frames_per_chunk, backbone_batch_size)
+        ),
+        predictor=PredictorMultiSeqWrapper(GoalFreePredictor(predictor)),
+        target_encoder=MultiSeqWrapper(
+            ChunkWindowEncoder(vjepa, target_encoder, frames_per_chunk, backbone_batch_size)
+        ),
+        embed_dim=int(encoder.embed_dim),
+        epoch=epoch,
+    )
+
+    for module in (bundled.encoder, bundled.predictor, bundled.target_encoder):
+        module.to(device)
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+    return bundled
+
+
+def prepare_bundle(model_cfg: dict, config: dict, checkpoint_path: str, device: str) -> ModelBundle:
+    kind = model_cfg.get("kind", "vjepa")
+    if kind == "goal_world_model":
+        return prepare_goal_world_model(config, checkpoint_path, device)
+    if kind != "vjepa":
+        raise ValueError(f"unknown model kind {kind!r}")
+    return prepare_world_model(config, checkpoint_path, device)
 
 
 # --------------------------------------------------------------------------- #
@@ -1744,6 +1964,22 @@ def generate_markdown_report(
         "prediction is appended and the oldest token dropped, so every RoPE position stays inside the "
         "range seen during pretraining."
     )
+    if any(meta.get("kind") == "goal_world_model" for meta in model_meta.values()):
+        lines.append(
+            "2b. **The goal-guided world model steps by a *chunk*, and is rolled out with its goal "
+            "withheld.** Its encoder summarizes `tokens_per_chunk` V-JEPA temporal tokens (4 x 2 = 8 "
+            "frames = 2s at 4 fps) into one latent, so a chunk occupies one temporal slot of `S` tokens "
+            "exactly as a tubelet embedding does and everything above carries over with `tubelet_size` "
+            "read as *frames per temporal unit*. A step advances 2s rather than 0.5s, so the same "
+            "horizon takes four times fewer steps - a property of the architecture, which is why every "
+            "curve here is indexed by lead time in seconds rather than by step. During training its "
+            "predictor is also conditioned on the latent of a chunk 4-16s further ahead (the goal); "
+            "**that input is withheld here**, using the learned null goal that "
+            "`world_model.goal_drop_prob` trains, so it rolls out on the past alone like every other "
+            "model. Telling it where the video ends up would make its problem strictly easier and the "
+            "comparison meaningless. What this measures is whether training *with* a goal produced a "
+            "better world model - not whether a goal helps at inference, which this report does not ask."
+        )
     lines.append(
         "3. **Masks follow the model's own interface.** For a non-causal model the context mask covers "
         "every patch of every temporal token but the last and the prediction mask covers exactly the "
@@ -1822,6 +2058,8 @@ def generate_markdown_report(
         if geom is None:
             continue
         intra = f"{geom.intra_tubelet_seconds:.2f}" if geom.tubelet_size > 1 else "n/a (1 frame)"
+        if meta.get("kind") == "goal_world_model":
+            name = f"{name} \u2020"
         lines.append(
             f"| {name} | `{meta['config']}` | {'yes' if geom.is_causal else 'no'} | "
             f"{'yes' if geom.uses_pretrained_backbone else 'no'} | {geom.sampling_fps:g} | "
@@ -1842,6 +2080,14 @@ def generate_markdown_report(
             f"{geom.crop_size} |"
         )
     lines.append("")
+    if any(meta.get("kind") == "goal_world_model" for meta in model_meta.values()):
+        lines.append(
+            "\u2020 Its temporal unit is a **chunk** of 4 V-JEPA tokens, not a single tubelet, so the "
+            "`Tubelet` column reads 8 frames and the within-tubelet gap is the spacing inside a whole "
+            "chunk. Rolled out with its goal input withheld (learned null goal), so it has the same "
+            "information as every other model here."
+        )
+        lines.append("")
     lines.append(
         "> The step size fixes how many steps a fixed ~1-minute horizon takes, and it varies a lot "
         "between models (0.5s/step needs 120 steps, 2s/step needs 30). The per-frame tables are indexed "
@@ -2094,11 +2340,11 @@ def main() -> None:
     # Only configs are read here, no checkpoints, so this is cheap.
     planned: List[dict] = []
     geometries: Dict[str, RolloutGeometry] = {}
-    for model_cfg in MODELS_CONFIG:
+    for model_cfg in ALL_MODELS_CONFIG:
         model_name = model_cfg["name"]
         try:
             config = load_config(model_cfg["config"])
-            geom = build_geometry(config, args.horizon_seconds)
+            geom = build_geometry_for(model_cfg, config, args.horizon_seconds)
             checkpoint_path = resolve_checkpoint(model_cfg, config)
         except Exception as exc:
             logger.error("Failed to plan %s: %s", model_name, exc)
@@ -2152,7 +2398,7 @@ def main() -> None:
         logger.info("%s", "=" * 80)
 
         try:
-            bundle = prepare_world_model(config, checkpoint_path, device)
+            bundle = prepare_bundle(model_cfg, config, checkpoint_path, device)
         except Exception as exc:
             logger.error("Failed to load %s: %s", model_name, exc)
             skipped_models.append((model_name, f"could not be loaded ({exc})"))
@@ -2180,6 +2426,7 @@ def main() -> None:
             "checkpoint": checkpoint_path,
             "epoch": bundle.epoch,
             "geometry": geom,
+            "kind": model_cfg.get("kind", "vjepa"),
         }
 
         try:
@@ -2251,6 +2498,12 @@ def main() -> None:
                     "step_seconds": geom.step_seconds,
                     "horizon_seconds": geom.horizon_seconds,
                     "is_causal": geom.is_causal,
+                    "kind": model_cfg.get("kind", "vjepa"),
+                    "goal_conditioning": (
+                        "withheld (null goal)"
+                        if model_cfg.get("kind") == "goal_world_model"
+                        else "n/a (model has no goal input)"
+                    ),
                     "feedback": args.feedback,
                     "feedback_is_oracle": args.feedback in ORACLE_FEEDBACK_MODES,
                     "checkpoint": checkpoint_path,
