@@ -46,6 +46,30 @@ This is index-for-index what `encode_ground_truth` in
 `evals/generate_world_model_report.py` does, so a latent cached here and a latent
 that report scores are the same tensor for the same (video, step).
 
+Two model kinds are supported, dispatched by `kind` exactly as that report does it:
+
+  * `vjepa` - the plain world models. One temporal slot is a tubelet
+    (`tubelet_size` frames, 0.5s at 4 fps), and `d_m` is the backbone width (1024
+    for ViT-L).
+  * `goal_world_model` - the goal-conditioned chunk model. Its V-JEPA backbone is
+    frozen *input tokenization*; the latent space being decoded is its own trained
+    chunk encoder's, so `d_m` is `model.embed_dim` (768), and one temporal slot is a
+    whole chunk (`tokens_per_chunk * tubelet_size` frames, 2s at 4 fps).
+
+    **The goal is never passed.** The target encoder has no goal input in the first
+    place, so `z_target` cannot depend on one; and any predictor call made here omits
+    the `goal` argument, which `ChunkRolloutPredictor` turns into the learned null
+    goal - the path `world_model.goal_drop_prob` trains. That keeps the cached latents
+    carrying the same information every other model's do. Entries configured with
+    `goal_lead_seconds` are refused outright (see `resolve_model_cfg`).
+
+Only three things differ per world model downstream - `d_m`, the token grid, and the
+fitted normalization buffers - and all three come out of the manifest, so the same
+decoder config trains against either kind. What is NOT equalized is the span of video
+a latent summarizes: 0.5s for a tubelet model, 2s for the chunk model. The decoder's
+task is identical either way (reconstruct the last frame of the last temporal unit),
+but a cross-model panel should be read knowing that.
+
 What is deliberately NOT cached: codec (VAE) latents. Encoding two 256px frames
 is a millisecond and the VAE is frozen and swappable, whereas re-running a ViT-L
 world model over a few thousand clips is tens of minutes. Keeping pixels in the
@@ -88,22 +112,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from evals.generate_patch_embedding_report import (
     DEFAULT_NORMALIZATION,
-    MODELS_CONFIG,
     denormalize_clip,
     load_config,
     load_manifest,
     slugify,
 )
 from evals.generate_world_model_report import (
+    ALL_MODELS_CONFIG,
     RolloutGeometry,
     autocast_config,
-    build_geometry,
+    build_geometry_for,
     encode_context,
+    goal_conditioning_label,
     layer_norm_last,
     load_long_clip,
     predict_next_token,
     predictor_masks,
-    prepare_world_model,
+    prepare_bundle,
     resolve_checkpoint,
     select_videos,
     temporal_slice,
@@ -149,6 +174,9 @@ class CacheHeader:
     spatial_tokens: int
     crop_size: int
     patch_size: int
+    # Frames spanned by ONE temporal slot: a tubelet for a plain V-JEPA world model, a
+    # whole chunk (tokens_per_chunk * tubelet_size) for the goal-conditioned one. The
+    # name is historical; read it as "frames per temporal unit".
     tubelet_size: int
     fps: float
     sampling_fps: float
@@ -156,6 +184,11 @@ class CacheHeader:
     window_tokens: int
     context_tokens: int
     is_causal: bool
+    # `vjepa` or `goal_world_model`. Recorded so a shard set states which architecture
+    # produced it without anyone having to re-derive it from the config.
+    kind: str
+    # Always "withheld" for the goal model - the decoder never receives a goal.
+    goal_conditioning: str
     target_frame_in_tubelet: str
     has_predictor_latents: bool
     normalization: Tuple[Sequence[float], Sequence[float]]
@@ -337,8 +370,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         default=None,
-        help="Name of the entry in evals.generate_patch_embedding_report.MODELS_CONFIG to cache. "
-        "Defaults to the single enabled entry if there is exactly one.",
+        help="Name of the entry in evals.generate_world_model_report.ALL_MODELS_CONFIG to cache - "
+        "plain V-JEPA world models plus the goal-conditioned chunk model. Defaults to the single "
+        "cacheable entry if there is exactly one. Entries that supply a goal ahead of the context are "
+        "refused; the decoder is always trained with the goal withheld.",
     )
     parser.add_argument("--output-dir", required=True, help="Directory to write shards and manifest.json into.")
     parser.add_argument(
@@ -389,17 +424,51 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_model_cfg(model_name: Optional[str]) -> dict:
+    """Pick an entry from `ALL_MODELS_CONFIG` - plain V-JEPA world models plus the
+    goal-conditioned chunk models.
+
+    Entries carrying `goal_lead_seconds` are rejected. Those are the report's
+    PRIVILEGED rollouts: they feed the predictor a goal read from real video past the
+    rollout's frontier. The decoder is trained with the goal WITHHELD, on the null-goal
+    path, so that its latents carry the same information every other model's do. Caching
+    a privileged entry would either duplicate the withheld shard set under a misleading
+    name (the goal never reaches the target encoder, so `z_target` is byte-identical) or,
+    for `z_pred`, quietly mix a future-reading latent into the comparison.
+    """
     if model_name is None:
-        if len(MODELS_CONFIG) != 1:
+        enabled = [cfg for cfg in ALL_MODELS_CONFIG if cfg.get("goal_lead_seconds") is None]
+        if len(enabled) != 1:
             raise SystemExit(
-                f"MODELS_CONFIG has {len(MODELS_CONFIG)} enabled entries; pass --model-name to pick one."
+                f"ALL_MODELS_CONFIG has {len(enabled)} cacheable entries; pass --model-name to pick one."
             )
-        return MODELS_CONFIG[0]
-    for cfg in MODELS_CONFIG:
-        if cfg["name"] == model_name:
-            return cfg
-    names = ", ".join(repr(c["name"]) for c in MODELS_CONFIG)
-    raise SystemExit(f"no model named {model_name!r} in MODELS_CONFIG; enabled entries: {names}")
+        return enabled[0]
+
+    for cfg in ALL_MODELS_CONFIG:
+        if cfg["name"] != model_name:
+            continue
+        if cfg.get("goal_lead_seconds") is not None:
+            withheld = next(
+                (
+                    other["name"]
+                    for other in ALL_MODELS_CONFIG
+                    if other.get("kind") == cfg.get("kind")
+                    and other.get("config") == cfg.get("config")
+                    and other.get("goal_lead_seconds") is None
+                ),
+                None,
+            )
+            raise SystemExit(
+                f"{model_name!r} supplies its goal {cfg['goal_lead_seconds']:g}s ahead of the context, "
+                "which reads real video past the rollout frontier. The decoder is trained with the goal "
+                "withheld so its latents are comparable with every other model's."
+                + (f" Use {withheld!r} instead." if withheld else "")
+            )
+        return cfg
+
+    names = ", ".join(
+        repr(c["name"]) for c in ALL_MODELS_CONFIG if c.get("goal_lead_seconds") is None
+    )
+    raise SystemExit(f"no cacheable model named {model_name!r}; entries: {names}")
 
 
 def main() -> None:
@@ -417,34 +486,60 @@ def main() -> None:
     # `total_tokens` already includes the leading window every target needs behind
     # it. Build once to learn `step_seconds`, then set the count directly rather
     # than back-solving a horizon in seconds, which would round.
-    geom = replace(build_geometry(config, horizon_seconds=1.0), num_steps=int(args.targets_per_clip))
+    geom = replace(
+        build_geometry_for(model_cfg, config, horizon_seconds=1.0),
+        num_steps=int(args.targets_per_clip),
+    )
+    kind = model_cfg.get("kind", "vjepa")
+    # What one temporal slot spans. A plain V-JEPA model's slot is a tubelet
+    # (tubelet_size frames); the goal-conditioned model's is a whole chunk
+    # (tokens_per_chunk * tubelet_size frames), which `build_geometry_for` reports
+    # through the same field. Everything downstream reads it as "frames per temporal
+    # unit", so only the wording here has to know the difference.
+    unit = "chunk" if kind == "goal_world_model" else "tubelet"
 
-    logger.info("model: %s (%s)", model_cfg["name"], checkpoint)
+    logger.info("model: %s [kind=%s] (%s)", model_cfg["name"], kind, checkpoint)
+    logger.info("goal conditioning: %s", goal_conditioning_label(model_cfg))
     logger.info(
-        "geometry: %d temporal token(s) per clip, %d spatial token(s), tubelet %d, step %.3fs, "
-        "crop %d, causal=%s",
+        "geometry: %d temporal unit(s) per clip, %d spatial token(s), %d frame(s) per %s, "
+        "step %.3fs, crop %d, causal=%s",
         geom.total_tokens,
         geom.spatial_tokens,
         geom.tubelet_size,
+        unit,
         geom.step_seconds,
         geom.crop_size,
         geom.is_causal,
     )
 
-    bundle = prepare_world_model(config, checkpoint, device)
+    bundle = prepare_bundle(model_cfg, config, checkpoint, device)
     autocast_kwargs = autocast_config(config, device, args.use_amp)
     logger.info(
         "latent protocol: teacher (target) encoder over a full %d-frame training-length window "
-        "(%d temporal token(s) at %g fps, tubelet %d, crop %d - all from the model's own config); "
-        "keeping only the last temporal step's %d token(s) of width %d.",
+        "(%d %s(s) of %d frame(s) at %g fps, crop %d - all from the model's own config); keeping only "
+        "the last %s's %d token(s) of width %d.",
         geom.frames_per_clip,
         geom.window_tokens,
-        geom.fps,
+        unit,
         geom.tubelet_size,
+        geom.fps,
         geom.crop_size,
+        unit,
         geom.spatial_tokens,
         bundle.embed_dim,
     )
+    if kind == "goal_world_model":
+        logger.info(
+            "the goal is never passed: the target encoder has no goal input at all, and any predictor "
+            "call made here goes through the null-goal path. A %s spans %.2fs, so this model's "
+            "x_t -> x_{t+1} step is %.2fs against a tubelet model's - a real architectural difference, "
+            "not a handicap. The decoder's task is unchanged (reconstruct the last frame of the last "
+            "temporal unit), but a cross-model panel is comparing latents that summarize different "
+            "spans of video.",
+            unit,
+            geom.step_seconds,
+            geom.step_seconds,
+        )
 
     normalization = config["data"].get("normalization", DEFAULT_NORMALIZATION)
     transform = make_transforms(
@@ -587,6 +682,8 @@ def main() -> None:
         window_tokens=int(geom.window_tokens),
         context_tokens=int(geom.context_tokens),
         is_causal=bool(geom.is_causal),
+        kind=kind,
+        goal_conditioning=goal_conditioning_label(model_cfg),
         target_frame_in_tubelet=args.target_frame_in_tubelet,
         has_predictor_latents=bool(args.store_predictor_latents),
         normalization=normalization,

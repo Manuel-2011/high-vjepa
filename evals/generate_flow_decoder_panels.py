@@ -968,15 +968,39 @@ def write_report(
     lines += [
         "## Runs",
         "",
-        "| world model | d_m | grid | latents | frame cond. | weights | codec ceiling |",
-        "|---|---|---|---|---|---|---|",
+        "| world model | kind | d_m | grid | latent spans | latents | frame cond. | weights | codec ceiling |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for bundle in bundles:
+        wm = bundle.provenance.get("world_model", {}) or {}
+        span = wm.get("step_seconds")
         lines.append(
-            f"| {bundle.name} | {bundle.latent_dim} | {tuple(bundle.decoder.latent_grid)} | "
+            f"| {bundle.name} | {wm.get('kind', 'vjepa')} | {bundle.latent_dim} | "
+            f"{tuple(bundle.decoder.latent_grid)} | "
+            f"{'?' if not span else f'{span:g}s'} | "
             f"{bundle.provenance.get('latent_source')} | {bundle.decoder.frame_conditioning} | "
             f"{bundle.provenance.get('weights')} | {bundle.codec_ceiling_db:.2f} dB |"
         )
+
+    # A chunk world model's latent summarizes 2s of video where a tubelet model's
+    # summarizes 0.5s. That is not equalizable - it is what the architecture is - but a
+    # reader comparing rows has to be told, or they will read a span difference as a
+    # quality difference.
+    spans = {
+        (bundle.provenance.get("world_model", {}) or {}).get("step_seconds")
+        for bundle in bundles
+    }
+    spans.discard(None)
+    spans.discard(0.0)
+    if len(spans) > 1:
+        lines += [
+            "",
+            "> **Latents summarize different spans of video.** The `latent spans` column above differs "
+            f"across these runs ({', '.join(f'{s:g}s' for s in sorted(spans))}). Each decoder was asked "
+            "the same question - reconstruct the last frame of the last temporal unit - but a longer span "
+            "means the latent had to compress more video into the same token budget. Read a difference "
+            "between those rows as *architecture*, not as latent quality.",
+        ]
     lines.append("")
 
     latent_only = not bundles[0].decoder.uses_frame_conditioning

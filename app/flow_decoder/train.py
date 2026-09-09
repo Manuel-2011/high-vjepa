@@ -294,7 +294,15 @@ def save_checkpoint(
                 "latent_channels": codec.latent_channels,
                 "downsample_factor": codec.downsample_factor,
             },
-            "world_model": {"name": info.model_name, "shard_root": str(info.root)},
+            "world_model": {
+                "name": info.model_name,
+                "shard_root": str(info.root),
+                # Architecture facts the panels need in order to caption a cross-model
+                # comparison honestly: a chunk model's latent summarizes 2s of video
+                # where a tubelet model's summarizes 0.5s.
+                "kind": info.kind,
+                "step_seconds": info.step_seconds,
+            },
             "latent_source": config["data"].get("latent_source", "target_encoder"),
             "metrics": metrics,
         },

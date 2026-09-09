@@ -147,6 +147,52 @@ Use the **same `--seed`, `--dataset-csv` and `--targets-per-clip`** for every
 world model — the panels index eval samples positionally, so identical settings
 are what makes "same clip, every row" true.
 
+### 1b. The goal-conditioned chunk world model
+
+`configs/train/vitl16-EK100/world-model-goal-256px.yaml` is a different architecture, and
+the cache handles it through the same `kind` dispatch
+[generate_world_model_report.py](../../evals/generate_world_model_report.py) uses:
+
+```bash
+python -m app.flow_decoder.latent_cache \
+    --model-name "Goal-guided world model (goal withheld)" \
+    --output-dir data/flow_decoder_shards/goal-wm/train \
+    --dataset-csv data/ek55_4fps_train.csv \
+    --num-clips 272 --targets-per-clip 6
+```
+
+**The goal is never passed.** Two independent reasons, both structural:
+
+- the **target encoder has no goal input at all**, so `z_target` cannot depend on one;
+- any predictor call omits the `goal` argument, which `ChunkRolloutPredictor` turns into
+  the learned null goal — the path `world_model.goal_drop_prob` trains.
+
+Entries configured with `goal_lead_seconds` (the report's privileged "goal 16s ahead"
+rollout, which reads video past the frontier) are **refused** by `resolve_model_cfg`.
+
+What differs from a plain V-JEPA model, and what does not:
+
+| | V-JEPA2 baseline | goal chunk model |
+|---|---|---|
+| latent source | teacher encoder, full trained window | *same* |
+| tokens handed to decoder | last temporal unit only, 256 | *same* |
+| one temporal unit | tubelet, 2 frames = **0.5 s** | chunk, 8 frames = **2 s** |
+| training-length window | 16 frames (8 units) | 72 frames (9 units) |
+| `d_m` | 1024 (ViT-L backbone) | **768** (`model.embed_dim`) |
+| decoder config | unchanged | unchanged |
+
+The V-JEPA backbone here is *frozen input tokenization*, so the latent space being
+decoded is the model's **own trained chunk encoder's** — which is why `d_m` is 768 rather
+than 1024. That is a permitted difference (`d_m`), so the same config trains it: only the
+adapter's input projection changes shape (0.59M vs 0.79M params), and the 201.7M shared
+parameters are identical.
+
+⚠️ **Read cross-model panels knowing the spans differ.** A chunk latent compresses 2 s of
+video into the same 256 tokens a tubelet latent uses for 0.5 s. The decoder's task is
+identical either way — reconstruct the last frame of the last temporal unit — but a
+visible difference between those rows may be *architecture* rather than latent quality.
+The panel report prints the span per run and emits an explicit warning when they differ.
+
 ### 2. Train, once per world model
 
 The **same config file** trains a decoder for any world model; only the shard set

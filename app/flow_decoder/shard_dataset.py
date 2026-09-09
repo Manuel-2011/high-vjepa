@@ -74,6 +74,19 @@ class ShardSetInfo:
     def has_predictor_latents(self) -> bool:
         return bool(self.manifest.get("has_predictor_latents", False))
 
+    @property
+    def kind(self) -> str:
+        """`vjepa` or `goal_world_model`. Absent in shard sets written before the
+        goal-conditioned model was supported, which were all plain V-JEPA."""
+        return str(self.manifest.get("kind", "vjepa"))
+
+    @property
+    def step_seconds(self) -> float:
+        """Video time spanned by one temporal unit - 0.5s for a tubelet model, 2s for
+        the chunk model. Not equalized between architectures, so it is carried through
+        to the panels rather than left in the cache log."""
+        return float(self.manifest.get("step_seconds", 0.0))
+
     def statistics(self, latent_source: str = "target_encoder") -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """The fitted (mean, std) buffers for a latent source, if they were written."""
         path = self.root / "statistics.pt"
@@ -88,9 +101,10 @@ class ShardSetInfo:
     def describe(self) -> str:
         m = self.manifest
         return (
-            f"{m['model_name']}: {m['num_samples']} sample(s) in {m['num_shards']} shard(s), "
-            f"d_m={m['latent_dim']} grid={tuple(m['latent_grid'])} crop={m['crop_size']} "
-            f"step={m['step_seconds']:.3f}s predictor_latents={self.has_predictor_latents}"
+            f"{m['model_name']} [kind={self.kind}]: {m['num_samples']} sample(s) in "
+            f"{m['num_shards']} shard(s), d_m={m['latent_dim']} grid={tuple(m['latent_grid'])} "
+            f"crop={m['crop_size']} step={m['step_seconds']:.3f}s "
+            f"predictor_latents={self.has_predictor_latents}"
         )
 
 
