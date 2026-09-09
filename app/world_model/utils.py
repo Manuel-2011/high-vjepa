@@ -230,8 +230,9 @@ class ChunkWindowEncoder(nn.Module):
 
     def forward(self, clip):
         B, _, T, _, _ = clip.shape
-        assert T % self.frames_per_chunk == 0, (
-            f"a {T}-frame clip is not a whole number of {self.frames_per_chunk}-frame chunks"
+        assert T >= self.frames_per_chunk and T % self.frames_per_chunk == 0, (
+            f"a {T}-frame clip is not a whole number of {self.frames_per_chunk}-frame chunks "
+            "(a clip shorter than one chunk usually means a window ran off the end of the video)"
         )
         num_chunks = T // self.frames_per_chunk
         chunks = split_into_chunks(clip, self.frames_per_chunk, num_chunks)
@@ -243,28 +244,40 @@ class ChunkWindowEncoder(nn.Module):
         return z.reshape(B, num_chunks * z.size(1), z.size(2))
 
 
-class GoalFreePredictor(nn.Module):
-    """`GoalConditionedPredictor` run with its goal branch switched off.
+class ChunkRolloutPredictor(nn.Module):
+    """`GoalConditionedPredictor` behind the one-tensor-in interface an autoregressive
+    rollout drives it with, with or without a goal.
 
-    Every sample takes the learned null goal and null horizon -- the path
-    `goal_drop_prob` trains -- so the predictor is asked to roll the world forward with
-    no intention supplied. Use it to compare against world models that have no goal
-    input at all, which would otherwise be given strictly less information.
+    `goal=None` puts every sample on the learned null goal and null horizon -- the path
+    `world_model.goal_drop_prob` trains -- so the predictor rolls the world forward with
+    no intention supplied. That is what makes it comparable to a world model that has no
+    goal input at all, which would otherwise be given strictly less information. The
+    goal tensor and position handed to the wrapped predictor are then inert: with
+    `keep_goal` all False the null token is broadcast to every key of the
+    cross-attention, so its output is that token whatever they say.
 
-    A goal tensor and position are still passed to the wrapped predictor because its
-    signature requires them, but they are inert: with `keep_goal` all False the null
-    token is broadcast to every key of the cross-attention, so its output is that token
-    whatever the goal or its position says.
+    Given a goal it conditions normally. `goal_pos` is in the predictor's own chunk
+    units, measured from the start of the context window being passed in -- so a goal
+    held a fixed lead ahead of a sliding context window sits at a *constant* position,
+    and may be given as a plain float.
     """
 
     def __init__(self, predictor):
         super().__init__()
         self.predictor = predictor
 
-    def forward(self, x, has_cls=False, **kwargs):
+    def forward(self, x, has_cls=False, goal=None, goal_pos=None, **kwargs):
         assert not has_cls, "the chunk predictor has no cls token"
         batch_size = x.size(0)
-        goal = x.new_zeros(batch_size, self.predictor.patches_per_chunk, self.predictor.embed_dim)
-        goal_pos = x.new_zeros(batch_size)
-        keep_goal = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+        keep = goal is not None
+        if goal is None:
+            goal = x.new_zeros(
+                batch_size, self.predictor.patches_per_chunk, self.predictor.embed_dim
+            )
+            goal_pos = x.new_zeros(batch_size)
+        elif goal_pos is None:
+            raise ValueError("a goal was supplied without its position")
+        elif not torch.is_tensor(goal_pos):
+            goal_pos = x.new_full((batch_size,), float(goal_pos))
+        keep_goal = torch.full((batch_size,), keep, dtype=torch.bool, device=x.device)
         return self.predictor(x, goal=goal, goal_pos=goal_pos, keep_goal=keep_goal)

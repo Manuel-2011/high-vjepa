@@ -75,8 +75,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.vjepa.utils import init_video_model, load_module_state_dict
 from app.world_model.utils import (
+    ChunkRolloutPredictor,
     ChunkWindowEncoder,
-    GoalFreePredictor,
     init_frozen_backbone,
     init_world_model,
 )
@@ -104,12 +104,24 @@ logger = logging.getLogger(__name__)
 # going it would be solving a strictly easier problem than every other model here, and
 # the comparison would say nothing. What this measures is whether learning *with* a goal
 # produced a better world model, not whether a goal helps at inference.
+# `goal_lead_seconds` turns the goal back on, held that many seconds ahead of the
+# context window at *every* step. That reads real video past the rollout's frontier, so
+# such an entry is PRIVILEGED - not comparable with the others as a measurement, only as
+# a ceiling. Its value against the withheld entry above is the paired comparison: same
+# weights, same clips, same steps, goal off vs goal on.
 EXTRA_MODELS_CONFIG = [
     {
         "name": "Goal-guided world model (goal withheld)",
         "checkpoint": "preliminary_experiments/EK100-world-model-goal-256px/latest.pt",
         "config": "configs/train/vitl16-EK100/world-model-goal-256px.yaml",
         "kind": "goal_world_model",
+    },
+    {
+        "name": "Goal-guided world model (goal 16s ahead)",
+        "checkpoint": "preliminary_experiments/EK100-world-model-goal-256px/latest.pt",
+        "config": "configs/train/vitl16-EK100/world-model-goal-256px.yaml",
+        "kind": "goal_world_model",
+        "goal_lead_seconds": 16.0,
     },
 ]
 
@@ -224,6 +236,9 @@ class RolloutGeometry:
     num_steps: int  # autoregressive steps taken
     is_causal: bool
     uses_pretrained_backbone: bool
+    # Temporal tokens decoded past the end of the rollout, for a privileged input that
+    # reads ahead of the frontier (a goal). Zero for every ordinary rollout.
+    extra_tokens: int = 0
 
     @property
     def step_seconds(self) -> float:
@@ -266,8 +281,9 @@ class RolloutGeometry:
         `window_tokens` of them are needed before the first prediction: the
         `context_tokens` the predictor sees, plus one extra leading token so the
         *last observed* frame also has a full ground-truth window behind it (see
-        `encode_ground_truth`)."""
-        return self.window_tokens + self.num_steps
+        `encode_ground_truth`). `extra_tokens` covers a goal read ahead of the
+        rollout's frontier."""
+        return self.window_tokens + self.num_steps + self.extra_tokens
 
     @property
     def total_sampled_frames(self) -> int:
@@ -290,12 +306,42 @@ class RolloutGeometry:
 
 
 @dataclass
+class GoalSchedule:
+    """Where the goal chunk sits at every step of a goal-conditioned rollout.
+
+    The goal is held a fixed `lead_seconds` ahead of the context window the step is
+    conditioning on. That window slides forward one chunk per step, so the goals slide
+    with it and step `k`'s goal is the `frames_per_chunk` frames at
+    `first_frame + k * frames_per_chunk` - a contiguous run, which is why they can all
+    be embedded in one call.
+
+    Because both ends move together, the goal's position *relative to the window* never
+    changes, which is what makes `position` a single number: `context_tokens` (the end
+    of the context, in the predictor's local chunk units) plus the lead. It is exactly
+    the `goal_pos` training computes for a goal sampled at this distance.
+    """
+
+    lead_seconds: float
+    lead_frames: int
+    first_frame: int  # first frame of step 0's goal chunk, within the decoded clip
+    frames_per_chunk: int
+    position: float  # goal position in the predictor's local chunk units, constant
+
+    @property
+    def extra_tokens(self) -> int:
+        """Temporal tokens the clip needs beyond the rollout itself."""
+        return math.ceil(self.lead_frames / self.frames_per_chunk)
+
+
+@dataclass
 class ModelBundle:
     encoder: torch.nn.Module
     predictor: torch.nn.Module
     target_encoder: torch.nn.Module
     embed_dim: int
     epoch: int
+    # Set only for a goal-conditioned rollout; None means the goal is withheld.
+    goal_schedule: Optional[GoalSchedule] = None
 
 
 @dataclass
@@ -436,7 +482,53 @@ def build_geometry(config: dict, horizon_seconds: float) -> RolloutGeometry:
     )
 
 
-def build_goal_world_model_geometry(config: dict, horizon_seconds: float) -> RolloutGeometry:
+def build_goal_schedule(config: dict, goal_lead_seconds: Optional[float]) -> Optional[GoalSchedule]:
+    """Lay out the goal chunks for a rollout that keeps its goal `goal_lead_seconds`
+    ahead of the context window. None when the goal is withheld.
+
+    The lead is checked against the range the model was trained to expect
+    (`world_model.goal_min_seconds` .. `goal_max_seconds`): a goal further out than the
+    training distribution ever placed one would be measuring extrapolation, not the
+    model. It does not have to be a whole number of chunks - training samples the goal
+    at frame resolution and `goal_pos` is a float - so any lead in range works.
+    """
+    if goal_lead_seconds is None:
+        return None
+
+    cfgs_wm = config["world_model"]
+    fps = float(config["data"]["fps"])
+    frames_per_chunk = int(cfgs_wm.get("tokens_per_chunk", 4)) * int(
+        config["vjepa"].get("tubelet_size", 2)
+    )
+    context_chunks = int(cfgs_wm.get("context_chunks", 8))
+    goal_min = float(cfgs_wm.get("goal_min_seconds", 4.0))
+    goal_max = float(cfgs_wm.get("goal_max_seconds", 16.0))
+    if not goal_min - 1e-6 <= goal_lead_seconds <= goal_max + 1e-6:
+        raise ValueError(
+            f"goal_lead_seconds ({goal_lead_seconds:g}s) is outside the {goal_min:g}-{goal_max:g}s "
+            "range this model was trained to place goals in, so the rollout would be measuring "
+            "extrapolation rather than the model."
+        )
+
+    lead_frames = int(round(goal_lead_seconds * fps))
+    if lead_frames < 1:
+        raise ValueError(f"a goal {goal_lead_seconds:g}s ahead is less than one frame at {fps:g} fps")
+
+    # The context of step 0 is clip tokens [1, 1 + context_chunks), so it ends at frame
+    # (1 + context_chunks) * frames_per_chunk and its goal starts `lead_frames` later.
+    window_tokens = context_chunks + 1
+    return GoalSchedule(
+        lead_seconds=float(goal_lead_seconds),
+        lead_frames=lead_frames,
+        first_frame=window_tokens * frames_per_chunk + lead_frames,
+        frames_per_chunk=frames_per_chunk,
+        position=context_chunks + lead_frames / frames_per_chunk,
+    )
+
+
+def build_goal_world_model_geometry(
+    config: dict, horizon_seconds: float, goal_lead_seconds: Optional[float] = None
+) -> RolloutGeometry:
     """`build_geometry` for the goal-guided chunk world model.
 
     Its autoregressive unit is a *chunk* -- `world_model.tokens_per_chunk` V-JEPA
@@ -473,6 +565,7 @@ def build_goal_world_model_geometry(config: dict, horizon_seconds: float) -> Rol
     window_tokens = context_chunks + 1
     step_seconds = frames_per_chunk / fps
     num_steps = max(1, int(round(horizon_seconds / step_seconds)))
+    schedule = build_goal_schedule(config, goal_lead_seconds)
 
     return RolloutGeometry(
         fps=fps,
@@ -492,13 +585,17 @@ def build_goal_world_model_geometry(config: dict, horizon_seconds: float) -> Rol
         num_steps=num_steps,
         is_causal=True,
         uses_pretrained_backbone=False,
+        # A goal held ahead of the frontier needs footage past the end of the rollout.
+        extra_tokens=0 if schedule is None else schedule.extra_tokens,
     )
 
 
 def build_geometry_for(model_cfg: dict, config: dict, horizon_seconds: float) -> RolloutGeometry:
     kind = model_cfg.get("kind", "vjepa")
     if kind == "goal_world_model":
-        return build_goal_world_model_geometry(config, horizon_seconds)
+        return build_goal_world_model_geometry(
+            config, horizon_seconds, model_cfg.get("goal_lead_seconds")
+        )
     if kind != "vjepa":
         raise ValueError(f"unknown model kind {kind!r}")
     return build_geometry(config, horizon_seconds)
@@ -582,7 +679,9 @@ def prepare_world_model(config: dict, checkpoint_path: str, device: str) -> Mode
     )
 
 
-def prepare_goal_world_model(config: dict, checkpoint_path: str, device: str) -> ModelBundle:
+def prepare_goal_world_model(
+    config: dict, checkpoint_path: str, device: str, goal_lead_seconds: Optional[float] = None
+) -> ModelBundle:
     """Rebuild the goal-guided chunk world model and dress it in the same interface
     `rollout_clips` uses for a V-JEPA world model.
 
@@ -590,8 +689,10 @@ def prepare_goal_world_model(config: dict, checkpoint_path: str, device: str) ->
       * `ChunkWindowEncoder` fuses the frozen V-JEPA 2 backbone with the trained chunk
         encoder, so a window of pixels maps straight to a window of chunk latents - one
         temporal slot of `P` tokens per chunk, the same layout a tubelet embedding has.
-      * `GoalFreePredictor` runs the predictor on its null-goal path, so the rollout is
-        given exactly the information every other model gets: the past, and nothing else.
+      * `ChunkRolloutPredictor` drives the predictor one step at a time. With no
+        `goal_lead_seconds` it runs the null-goal path, so the rollout gets exactly the
+        information every other model gets: the past, and nothing else. With one, the
+        goal is supplied at that fixed lead - a privileged input, see `GoalSchedule`.
 
     Both are then wrapped in the repo's `MultiSeqWrapper`/`PredictorMultiSeqWrapper`, so
     the returned bundle is structurally identical to `prepare_world_model`'s and the
@@ -611,8 +712,9 @@ def prepare_goal_world_model(config: dict, checkpoint_path: str, device: str) ->
     # dropped its goal, those parameters are still at their zero initialization and the
     # model has never once been asked to predict without an intention - the numbers
     # would be measuring an untrained code path, not a world model.
+    schedule = build_goal_schedule(config, goal_lead_seconds)
     goal_drop_prob = float(cfgs_wm.get("goal_drop_prob", 0.0))
-    if goal_drop_prob <= 0.0:
+    if schedule is None and goal_drop_prob <= 0.0:
         raise ValueError(
             "this model was trained with world_model.goal_drop_prob = 0, so its null goal was never "
             "trained and it has never predicted without a goal; rolling it out unconditionally would "
@@ -682,12 +784,13 @@ def prepare_goal_world_model(config: dict, checkpoint_path: str, device: str) ->
         encoder=MultiSeqWrapper(
             ChunkWindowEncoder(vjepa, encoder, frames_per_chunk, backbone_batch_size)
         ),
-        predictor=PredictorMultiSeqWrapper(GoalFreePredictor(predictor)),
+        predictor=PredictorMultiSeqWrapper(ChunkRolloutPredictor(predictor)),
         target_encoder=MultiSeqWrapper(
             ChunkWindowEncoder(vjepa, target_encoder, frames_per_chunk, backbone_batch_size)
         ),
         embed_dim=int(encoder.embed_dim),
         epoch=epoch,
+        goal_schedule=schedule,
     )
 
     for module in (bundled.encoder, bundled.predictor, bundled.target_encoder):
@@ -698,10 +801,21 @@ def prepare_goal_world_model(config: dict, checkpoint_path: str, device: str) ->
     return bundled
 
 
+def goal_conditioning_label(model_cfg: dict) -> str:
+    if model_cfg.get("kind") != "goal_world_model":
+        return "n/a (model has no goal input)"
+    lead = model_cfg.get("goal_lead_seconds")
+    if lead is None:
+        return "withheld (null goal)"
+    return f"supplied, held {lead:g}s ahead of the context (PRIVILEGED: reads past the frontier)"
+
+
 def prepare_bundle(model_cfg: dict, config: dict, checkpoint_path: str, device: str) -> ModelBundle:
     kind = model_cfg.get("kind", "vjepa")
     if kind == "goal_world_model":
-        return prepare_goal_world_model(config, checkpoint_path, device)
+        return prepare_goal_world_model(
+            config, checkpoint_path, device, model_cfg.get("goal_lead_seconds")
+        )
     if kind != "vjepa":
         raise ValueError(f"unknown model kind {kind!r}")
     return prepare_world_model(config, checkpoint_path, device)
@@ -1067,6 +1181,35 @@ def encode_context(
         return bundle.encoder([frames])[0]
 
 
+@torch.no_grad()
+def encode_goals(
+    bundle: ModelBundle,
+    geom: RolloutGeometry,
+    clip: torch.Tensor,
+    schedule: GoalSchedule,
+    autocast_kwargs: dict,
+) -> torch.Tensor:
+    """Goal latents for every step of a goal-conditioned rollout, (B, num_steps, S, D).
+
+    Step `k`'s goal is the chunk `schedule.lead_seconds` past the end of the context
+    that step conditions on. Both slide forward one chunk per step, so the goals are the
+    contiguous run of chunks starting at `schedule.first_frame` and can be embedded in a
+    single call.
+
+    Produced by the *target* encoder and layer-normalized, which is how training builds
+    the goal (`forward_target` in app/world_model/train.py) - the same space the
+    prediction targets live in.
+
+    PRIVILEGED: these frames sit ahead of the rollout's frontier, so a model given them
+    is seeing real future video that no other model in this report gets.
+    """
+    start = schedule.first_frame
+    frames = clip[:, :, start : start + geom.num_steps * schedule.frames_per_chunk]
+    with torch.autocast(**autocast_kwargs):
+        tokens = bundle.target_encoder([frames])[0]
+    return layer_norm_last(tokens.float()).unflatten(1, (geom.num_steps, geom.spatial_tokens))
+
+
 def predictor_masks(geom: RolloutGeometry, batch_size: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
     """Context/prediction masks for a non-causal predictor.
 
@@ -1089,6 +1232,8 @@ def predict_next_token(
     masks: Optional[Tuple[torch.Tensor, torch.Tensor]],
     mask_token_index: int,
     autocast_kwargs: dict,
+    goal: Optional[torch.Tensor] = None,
+    goal_pos: Optional[float] = None,
 ) -> torch.Tensor:
     """One step of the world model: (B, n_ctx*S, D) context -> (B, S, D) next frame.
 
@@ -1108,10 +1253,14 @@ def predict_next_token(
     what makes `mask_token_index` selectable: the wrapper hard-codes it to the
     index of the dataset a clip came from, which is information a rollout over an
     arbitrary manifest does not have.
+
+    `goal` is only ever set for the goal-conditioned chunk model, and is forwarded only
+    when present - a V-JEPA predictor has no such argument.
     """
+    goal_kwargs = {} if goal is None else {"goal": goal, "goal_pos": goal_pos}
     with torch.autocast(**autocast_kwargs):
         if geom.is_causal:
-            out = bundle.predictor.backbone(context, has_cls=False)
+            out = bundle.predictor.backbone(context, has_cls=False, **goal_kwargs)
             out = out[:, -geom.spatial_tokens :]
         else:
             context_mask, predict_mask = masks
@@ -1238,6 +1387,11 @@ def rollout_clips(
 
             ground_truth = encode_ground_truth(bundle, geom, clip, autocast_kwargs)
             reference = ground_truth.normalized[:, 0]  # last observed frame, in GT space
+            goals = (
+                None
+                if bundle.goal_schedule is None
+                else encode_goals(bundle, geom, clip, bundle.goal_schedule, autocast_kwargs)
+            )
 
             # Observed context starts at temporal token 1: token 0 exists only so
             # the last observed frame has a full ground-truth window behind it.
@@ -1256,7 +1410,14 @@ def rollout_clips(
 
             for step in range(geom.num_steps):
                 prediction = predict_next_token(
-                    bundle, geom, context, masks, mask_token_index, autocast_kwargs
+                    bundle,
+                    geom,
+                    context,
+                    masks,
+                    mask_token_index,
+                    autocast_kwargs,
+                    goal=None if goals is None else goals[:, step],
+                    goal_pos=None if goals is None else bundle.goal_schedule.position,
                 )
                 target = ground_truth.normalized[:, step + 1]
 
@@ -1358,6 +1519,7 @@ def rollout_clips(
                     mask_token_index,
                     autocast_kwargs,
                     feedback_mode,
+                    goals,
                 )
 
             result.rows.extend(batch_rows)
@@ -1388,6 +1550,7 @@ def add_teacher_forced_metrics(
     mask_token_index: int,
     autocast_kwargs: dict,
     feedback_mode: str,
+    goals: Optional[torch.Tensor] = None,
 ) -> None:
     """Attach the single-step (teacher-forced) distance for every step, in place.
 
@@ -1405,7 +1568,16 @@ def add_teacher_forced_metrics(
         context = encode_context(bundle, geom, clip, step + 1, autocast_kwargs)
         if feedback_mode == "layer_norm":
             context = layer_norm_last(context.float()).to(context.dtype)
-        prediction = predict_next_token(bundle, geom, context, masks, mask_token_index, autocast_kwargs)
+        prediction = predict_next_token(
+            bundle,
+            geom,
+            context,
+            masks,
+            mask_token_index,
+            autocast_kwargs,
+            goal=None if goals is None else goals[:, step],
+            goal_pos=None if goals is None else bundle.goal_schedule.position,
+        )
         target = ground_truth.normalized[:, step + 1]
         distances = frame_distances(prediction, target)
 
@@ -1677,6 +1849,31 @@ def save_collapse_chart(step_frames: Dict[str, pd.DataFrame], output_path: Path)
 # --------------------------------------------------------------------------- #
 
 
+def goal_pairs(
+    model_meta: Dict[str, dict], step_frames: Dict[str, pd.DataFrame]
+) -> List[Tuple[str, str]]:
+    """(goal-withheld, goal-supplied) pairs that share a checkpoint.
+
+    Two entries built from the same checkpoint, one privileged and one not, differ by
+    exactly one thing - whether the goal was supplied - which is the only controlled
+    comparison the report can make about the goal itself.
+    """
+    usable = [n for n in model_meta if n in step_frames and not step_frames[n].empty]
+    pairs = []
+    for supplied in usable:
+        if not model_meta[supplied].get("privileged"):
+            continue
+        for withheld in usable:
+            if (
+                not model_meta[withheld].get("privileged")
+                and model_meta[withheld].get("kind") == "goal_world_model"
+                and model_meta[withheld]["checkpoint"] == model_meta[supplied]["checkpoint"]
+            ):
+                pairs.append((withheld, supplied))
+                break
+    return pairs
+
+
 def fmt(value: float, digits: int = 3) -> str:
     if value is None or (isinstance(value, float) and not np.isfinite(value)):
         return "n/a"
@@ -1729,6 +1926,9 @@ def generate_markdown_report(
         (name for name in model_meta if name in step_frames and not step_frames[name].empty),
         key=lambda name: model_meta[name]["mean_norm"],
     )
+    # A run that is handed real video from beyond its own frontier cannot be allowed to
+    # win the headline claim, so the leader is picked from the like-for-like entries only.
+    fair_ranked = [name for name in ranked if not model_meta[name].get("privileged")]
 
     lines.append("# Autoregressive World-Model Report")
     lines.append("")
@@ -1767,13 +1967,30 @@ def generate_markdown_report(
         lines.append("No model produced a usable rollout - check the log for errors.")
         lines.append("")
     else:
-        leader = ranked[0]
+        leader = (fair_ranked or ranked)[0]
         meta = model_meta[leader]
         lines.append(
             f"- **{leader}** has the best horizon-averaged normalized {METRIC_LABELS[primary]}: "
             f"**{fmt(meta['mean_norm'])}** over {meta['geometry'].num_steps} steps "
-            f"({meta['geometry'].horizon_seconds:.0f}s)."
+            f"({meta['geometry'].horizon_seconds:.0f}s)"
+            + (
+                " (of the entries that see only the past; the privileged goal-conditioned run below is "
+                "excluded from this claim)."
+                if len(fair_ranked) < len(ranked)
+                else "."
+            )
         )
+        for withheld, supplied in goal_pairs(model_meta, step_frames):
+            off, on = model_meta[withheld], model_meta[supplied]
+            delta = off["mean_norm"] - on["mean_norm"]
+            lines.append(
+                f"- **What the goal is worth**: the same weights score **{fmt(off['mean_norm'])}** with "
+                f"the goal withheld and **{fmt(on['mean_norm'])}** with it supplied "
+                f"{on['goal_lead_seconds']:g}s ahead - a difference of **{fmt(delta)}** "
+                f"({'better' if delta > 0 else 'worse'} with the goal). The goal-supplied run reads real "
+                "video past its own frontier, so this is the value of the conditioning signal, not a "
+                "score comparable with the other models."
+            )
         for name in ranked:
             meta = model_meta[name]
             crossing = meta.get("crossing_s")
@@ -1980,6 +2197,17 @@ def generate_markdown_report(
             "comparison meaningless. What this measures is whether training *with* a goal produced a "
             "better world model - not whether a goal helps at inference, which this report does not ask."
         )
+    if any(meta.get("privileged") for meta in model_meta.values()):
+        lines.append(
+            "2c. **A second, PRIVILEGED entry hands that goal back.** The `goal Ns ahead` variant is the "
+            "same weights and the same clips, but at every step it is given the target-encoder latent of "
+            "the chunk `N` seconds past the end of the context it is conditioning on - so the goal slides "
+            "forward with the rollout and stays at the fixed lead the model was trained on. Being a real "
+            "chunk of the video ahead of the rollout's frontier, it is **information no other model here "
+            "has**, which is why this entry is a ceiling rather than a measurement. Read it only against "
+            "its own goal-withheld twin: the gap between the two is what the goal is worth to this model, "
+            "and it is the only pair in the report that differs by exactly one thing."
+        )
     lines.append(
         "3. **Masks follow the model's own interface.** For a non-causal model the context mask covers "
         "every patch of every temporal token but the last and the prediction mask covers exactly the "
@@ -2060,6 +2288,8 @@ def generate_markdown_report(
         intra = f"{geom.intra_tubelet_seconds:.2f}" if geom.tubelet_size > 1 else "n/a (1 frame)"
         if meta.get("kind") == "goal_world_model":
             name = f"{name} \u2020"
+        if meta.get("privileged"):
+            name = f"{name} \u2021"
         lines.append(
             f"| {name} | `{meta['config']}` | {'yes' if geom.is_causal else 'no'} | "
             f"{'yes' if geom.uses_pretrained_backbone else 'no'} | {geom.sampling_fps:g} | "
@@ -2084,9 +2314,24 @@ def generate_markdown_report(
         lines.append(
             "\u2020 Its temporal unit is a **chunk** of 4 V-JEPA tokens, not a single tubelet, so the "
             "`Tubelet` column reads 8 frames and the within-tubelet gap is the spacing inside a whole "
-            "chunk. Rolled out with its goal input withheld (learned null goal), so it has the same "
-            "information as every other model here."
+            "chunk. Whether its goal is withheld or supplied is in the entry's own name; only a row "
+            "also marked \u2021 was given one."
         )
+        lines.append("")
+    privileged = [
+        (name, meta) for name, meta in model_meta.items() if meta.get("privileged")
+    ]
+    if privileged:
+        for name, meta in privileged:
+            geom = meta["geometry"]
+            lines.append(
+                f"\u2021 **{name} is privileged and is not a like-for-like measurement.** Its goal is "
+                f"supplied at every step, held {meta['goal_lead_seconds']:g}s ahead of the context, which "
+                f"means {geom.extra_tokens * geom.frames_per_token} extra frame(s) of real video are read "
+                f"past the end of the rollout - {geom.total_frames} frames decoded in total against "
+                f"{geom.window_tokens + geom.num_steps} tokens' worth of rollout. Compare it with its "
+                "goal-withheld twin, not with the other models."
+            )
         lines.append("")
     lines.append(
         "> The step size fixes how many steps a fixed ~1-minute horizon takes, and it varies a lot "
@@ -2404,6 +2649,16 @@ def main() -> None:
             skipped_models.append((model_name, f"could not be loaded ({exc})"))
             continue
 
+        if model_cfg.get("goal_lead_seconds") is not None:
+            logger.warning(
+                "PRIVILEGED RUN: %s is rolled out with its goal supplied, held %.1fs ahead of the "
+                "context at every step. That reads real video %d frame(s) past the rollout's "
+                "frontier, which no other model here gets, so its numbers are a ceiling to compare "
+                "against the goal-withheld entry - not a like-for-like measurement.",
+                model_name,
+                float(model_cfg["goal_lead_seconds"]),
+                geom.extra_tokens * geom.frames_per_token,
+            )
         logger.info(
             "%s: %s, %.3f fps, tubelet %d, %d spatial tokens, %d context tokens (%.1fs), "
             "%d steps of %.2fs = %.0fs horizon",
@@ -2427,6 +2682,8 @@ def main() -> None:
             "epoch": bundle.epoch,
             "geometry": geom,
             "kind": model_cfg.get("kind", "vjepa"),
+            "goal_lead_seconds": model_cfg.get("goal_lead_seconds"),
+            "privileged": model_cfg.get("goal_lead_seconds") is not None,
         }
 
         try:
@@ -2499,11 +2756,10 @@ def main() -> None:
                     "horizon_seconds": geom.horizon_seconds,
                     "is_causal": geom.is_causal,
                     "kind": model_cfg.get("kind", "vjepa"),
-                    "goal_conditioning": (
-                        "withheld (null goal)"
-                        if model_cfg.get("kind") == "goal_world_model"
-                        else "n/a (model has no goal input)"
-                    ),
+                    "goal_conditioning": goal_conditioning_label(model_cfg),
+                    "goal_lead_seconds": model_cfg.get("goal_lead_seconds"),
+                    "reads_future_beyond_rollout": model_cfg.get("goal_lead_seconds") is not None,
+                    "extra_tokens": geom.extra_tokens,
                     "feedback": args.feedback,
                     "feedback_is_oracle": args.feedback in ORACLE_FEEDBACK_MODES,
                     "checkpoint": checkpoint_path,
