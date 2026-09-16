@@ -246,7 +246,7 @@ rather than producing a picture that looks like a finding.
 | 1 `reconstruction` | What does the latent pin down? `x_t` (context) \| truth \| **codec ceiling** \| `D(z_target)` \| `D(z_pred)` |
 | 2 `guidance` | What does the latent add over persistence? CFG sweep `w = 0 … 5` |
 | 3 `seeds` | What does the latent leave free? Same latent, K seeds, + per-pixel std map |
-| 4 `lead_time` | How does legibility decay with distance? Teacher-forced ladder, or caller-supplied rollout latents |
+| 4 `lead_time` | How does legibility decay with distance? Teacher-forced ladder, or (`--rollout-latents`) a real autoregressive rollout |
 | 5 `token_ablation` | Which pixels does which token block govern? |
 | 6 `crossmodel` | The comparison itself, + a scored **latent-swap control** (`follows`) |
 
@@ -264,9 +264,42 @@ Two failure modes look like findings and are not, and the report says so:
 3. Blur that is **uniform across every model** compared — a property of this
    decoder configuration and step budget, not of any one latent space.
 
-Rollout latents for panel 4 are **supplied by the caller**; this harness never
-rolls a world model forward (that is `evals/generate_world_model_report.py`'s
-job, and multi-frame rollout generation is out of scope). Expected file:
+#### Panel 4 as an autoregressive rollout
+
+By default panel 4 is teacher-forced: each column is an independent one-step
+problem from real context, so the row shows how scene difficulty varies along a
+clip, not how far the world model can actually see.
+
+`--rollout-latents` turns it into a real rollout. The harness rebuilds the world
+model **from the shard set's own `manifest.json`** (which records its checkpoint,
+config and kind), rolls it `--lead-time-steps` steps forward feeding the predictor
+its own output at every step, and decodes what it emits. The rollout is the same
+code path `evals/generate_world_model_report.py` measures — the functions are
+imported from it — so a latent decoded here is the tensor that report scores for
+the same (model, video, step). Every latent is decoded against the **last observed
+frame**, so decay along the row is the world model compounding its own error and
+not the decoder refreshing.
+
+```bash
+python evals/generate_flow_decoder_panels.py ... --panels lead_time --rollout-latents
+```
+
+The **goal-conditioned chunk model** gets two figures instead of one, on the same
+clip with the same context:
+
+| figure | goal | reads |
+|---|---|---|
+| `…-no-goal.png` | withheld (the learned null goal) | past only — the regime its cached latents were made under, and the only one comparable with any other model |
+| `…-goal.png` | supplied `--rollout-goal-lead-seconds` (default 16s) ahead of the sliding context window | **PRIVILEGED**: real video past the rollout's own frontier, so it is a ceiling, not a measurement |
+
+One step of that model is one chunk — `tokens_per_chunk` (4) V-JEPA temporal
+tokens, 8 frames, 2s at 4 fps — so its columns advance 4× further per step than a
+tubelet model's. Columns are labelled in seconds for that reason. Its goal figure
+carries a third row showing each step's goal chunk, so what the model was aimed at
+is visible next to what it produced.
+
+`--rollout-latents-file` still decodes latents rolled out elsewhere, for latents
+produced outside this repo:
 
 ```python
 torch.save({"latents": (K, S, d_m), "frame_prev": (3, H, W) uint8,
@@ -290,5 +323,4 @@ attached.
 
 The ℓ2-regression Probe decoder (separate deliverable), training or modifying any
 world model, training or fine-tuning the VAE, GAN/perceptual losses and
-discriminators, multi-frame autoregressive rollout *generation*, and any web UI
-beyond the 2AFC app above.
+discriminators, and any web UI beyond the 2AFC app above.

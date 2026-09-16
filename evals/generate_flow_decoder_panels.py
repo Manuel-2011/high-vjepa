@@ -32,10 +32,14 @@ noise seed, same solver, same step count, same guidance:
        and it needs no ground truth.
 
   4. `lead_time`       How does legibility decay with prediction distance? A
-       ladder over consecutive one-step targets of one clip, or - with
-       `--rollout-latents` - over caller-supplied autoregressive rollout latents.
-       This harness never rolls a world model forward itself; that is the
-       world-model report's job and explicitly out of scope here.
+       ladder over consecutive one-step targets of one clip - each an independent
+       one-step problem - or, with `--rollout-latents`, a true autoregressive
+       rollout in which the world model is fed its own predictions and the row
+       shows its error compounding. The rollout is performed here, by the same
+       code path `evals/generate_world_model_report.py` measures, so no
+       precomputed latent file is needed. The goal-conditioned chunk model gets
+       two rollouts - goal withheld and goal supplied 16s ahead - because for
+       that model those are two different world models' worth of behaviour.
 
   5. `token_ablation`  Which pixels does which token control? A spatial block of
        latent tokens is replaced by the fitted channel mean (the "no information"
@@ -73,7 +77,7 @@ import argparse
 import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -87,7 +91,29 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.flow_decoder.shard_dataset import ShardSet, frames_to_unit, load_shard_set
+from app.flow_decoder.latent_cache import frame_in_tubelet, to_uint8
+from app.flow_decoder.shard_dataset import ShardSet, ShardSetInfo, frames_to_unit, load_shard_set
+from evals.generate_patch_embedding_report import load_config, load_manifest
+from evals.generate_world_model_report import (
+    ORACLE_FEEDBACK_MODES,
+    apply_feedback,
+    autocast_config,
+    build_geometry_for,
+    build_goal_schedule,
+    context_scale,
+    encode_context,
+    encode_goals,
+    feedback_scale,
+    FEEDBACK_MODES,
+    layer_norm_last,
+    load_long_clip,
+    predict_next_token,
+    predictor_masks,
+    prepare_bundle,
+    resolve_checkpoint,
+    select_videos,
+)
+from evals.video_classification_frozen.utils import make_transforms
 from src.models.flow_decoder.decoder import FlowMatchingDecoder
 from src.models.flow_decoder.flow import sample_ode
 from src.models.flow_decoder.latent_adapter import build_token_coords
@@ -102,6 +128,16 @@ PANELS = ("reconstruction", "guidance", "seeds", "lead_time", "token_ablation", 
 PERMITTED_DIFFERENCES = ("latent_dim", "latent_grid")
 
 DEFAULT_GUIDANCE_LADDER = (0.0, 1.0, 1.5, 2.0, 3.0, 5.0)
+
+# Feedback bridges a rollout may use. `oracle_rescale` is excluded on purpose: it
+# rescales each prediction by the true statistics of the frame being predicted, so a
+# panel built on it would be showing the decoder a latent that already read the future.
+ROLLOUT_FEEDBACK_MODES = tuple(m for m in FEEDBACK_MODES if m not in ORACLE_FEEDBACK_MODES)
+
+# Lead at which the goal-conditioned model's second rollout is given its goal. The
+# model is trained with goals sampled in `world_model.goal_min_seconds ..
+# goal_max_seconds` (4-16s), so this is the far end of what it has ever seen.
+DEFAULT_GOAL_LEAD_SECONDS = 16.0
 
 
 def configure_logging(log_path: Path) -> None:
@@ -584,6 +620,309 @@ def panel_seeds(
 
 
 # --------------------------------------------------------------------------- #
+# Autoregressive rollout
+# --------------------------------------------------------------------------- #
+#
+# Panel 4's `--rollout-latents` mode drives the world model itself rather than
+# reading a precomputed latent file. Everything below is the same code path
+# `evals/generate_world_model_report.py` measures - the functions are imported from
+# it, not reimplemented - so a latent decoded here is the same tensor that report
+# scores for the same (model, video, step). What is added is only the bookkeeping the
+# report has no use for: keeping the emitted latents, and the pixels to hang them
+# next to.
+#
+# The world model is rebuilt from the *shard set's own manifest*, which records the
+# checkpoint, the config and the model kind. That is deliberate: the latents a
+# decoder was trained on and the latents it is being asked to decode then provably
+# come from the same weights, with no second place to state which world model this is
+# and no way for the two to drift apart.
+
+
+@dataclass
+class RolloutSettings:
+    """How to roll a world model forward for panel 4."""
+
+    enabled: bool = False
+    feedback: str = "rescale"
+    goal_lead_seconds: float = DEFAULT_GOAL_LEAD_SECONDS
+    # Manifest of long videos to roll out on. None means the one the shard set was
+    # cached from, which is the held-out split the decoder never trained on.
+    dataset_csv: Optional[str] = None
+    clip_index: int = 0
+    seed: int = 42
+    use_amp: bool = True
+    # Which of the predictor's mask tokens a non-causal model uses. Fixed rather than
+    # exposed, because `latent_cache` also defaults to 0: the rollout and the cached
+    # `z_pred` a reader compares it against then come out of the same code path.
+    mask_token_index: int = 0
+
+
+@dataclass
+class RolloutTrace:
+    """One finished rollout: latents to decode, and the pixels to judge them by."""
+
+    label: str
+    suffix: str  # disambiguates this trace's figure filename
+    latents: torch.Tensor  # (K, S, d_m) predictor outputs, in step order
+    observed: torch.Tensor  # (3, H, W) uint8 - the last frame the model actually saw
+    truth: torch.Tensor  # (K, 3, H, W) uint8
+    step_seconds: float
+    video_path: str
+    start_frame: int
+    # Goal-conditioned traces only: the frame standing for each step's goal chunk.
+    goals: Optional[torch.Tensor] = None
+    goal_lead_seconds: Optional[float] = None
+
+    @property
+    def num_steps(self) -> int:
+        return int(self.latents.size(0))
+
+
+def world_model_cfg(info: ShardSetInfo) -> dict:
+    """The `ALL_MODELS_CONFIG`-shaped entry this shard set was cached from.
+
+    Everything needed to rebuild the world model is already in the shard manifest;
+    `latent_cache` writes it there precisely so a consumer never has to be told
+    separately which model it is looking at.
+    """
+    manifest = info.manifest
+    missing = [key for key in ("checkpoint", "config") if not manifest.get(key)]
+    if missing:
+        raise SystemExit(
+            f"{info.root / 'manifest.json'} has no {', '.join(missing)}, so the world model that "
+            "produced these latents cannot be rebuilt. Re-cache the shard set with the current "
+            "app/flow_decoder/latent_cache.py, or pass --rollout-latents-file instead."
+        )
+    return {
+        "name": manifest["model_name"],
+        "checkpoint": manifest["checkpoint"],
+        "config": manifest["config"],
+        "kind": info.kind,
+    }
+
+
+@torch.no_grad()
+def rollout_latents(
+    wm,
+    geom,
+    clip: torch.Tensor,
+    feedback: str,
+    mask_token_index: int,
+    autocast_kwargs: dict,
+    goals: Optional[torch.Tensor],
+    goal_position: Optional[float],
+) -> torch.Tensor:
+    """`rollout_clips`' inner loop, kept for the latents instead of the distances.
+
+    Step k's prediction is fed back as context for step k+1 and the oldest temporal
+    unit is dropped, so the predictor always sees a window of the size it was trained
+    on. The *emitted* latent is the predictor's raw output - the same tensor
+    `latent_cache` stores as `z_pred` - while the *fed back* copy goes through
+    `apply_feedback`, because the predictor is trained to emit layer-normalized
+    targets but to consume raw context-encoder features.
+
+    Returns (K, S, d_m) on the CPU; `clip` is a single clip, (1, C, T, H, W).
+    """
+    device = str(clip.device)
+    masks = None if geom.is_causal else predictor_masks(geom, clip.size(0), device)
+
+    # Context starts at temporal unit 1: unit 0 exists only so the last observed frame
+    # has a full window behind it, exactly as `encode_ground_truth` lays it out.
+    context = encode_context(wm, geom, clip, 1, autocast_kwargs)
+    frozen_scale = context_scale(context)
+    if feedback == "layer_norm":
+        context = layer_norm_last(context.float()).to(context.dtype)
+
+    emitted: List[torch.Tensor] = []
+    for step in range(geom.num_steps):
+        prediction = predict_next_token(
+            wm,
+            geom,
+            context,
+            masks,
+            mask_token_index,
+            autocast_kwargs,
+            goal=None if goals is None else goals[:, step],
+            goal_pos=None if goals is None else goal_position,
+        )
+        emitted.append(prediction[0].float().cpu())
+        # `ground_truth=None` is safe only because oracle feedback is refused upstream;
+        # every other mode reads the context and the frozen anchor and nothing else.
+        scale = feedback_scale(feedback, context, frozen_scale, None, step)
+        context = torch.cat(
+            [
+                context[:, geom.spatial_tokens :],
+                apply_feedback(prediction, feedback, scale, context.dtype),
+            ],
+            dim=1,
+        )
+    return torch.stack(emitted)
+
+
+def _frames_uint8(clip: torch.Tensor, indices: Sequence[int], normalization) -> torch.Tensor:
+    """(N, 3, H, W) uint8 RGB for a list of frame indices of a (C, T, H, W) clip."""
+    return torch.stack([to_uint8(clip[:, i], normalization) for i in indices])
+
+
+@torch.no_grad()
+def run_rollouts(
+    bundle: DecoderBundle,
+    settings: RolloutSettings,
+    num_steps: int,
+    device: str,
+) -> List[RolloutTrace]:
+    """Roll this bundle's world model forward, once per conditioning regime.
+
+    A plain V-JEPA world model has one regime and yields one trace. The
+    goal-conditioned chunk model yields two, on the *same clip with the same context*:
+    the goal withheld (the learned null goal - what the decoder's latents were cached
+    under, and the only regime comparable with any other model) and the goal supplied
+    `goal_lead_seconds` ahead of the sliding context window. The second is PRIVILEGED:
+    its goal is read from real video past the rollout's own frontier, so the pair is
+    not "two models" but "one model told where it is going, or not".
+
+    Both regimes use the goal-conditioned geometry, whose clip is longer by the frames
+    the goal reads ahead. The withheld rollout simply ignores that tail, which is what
+    keeps the two figures a controlled comparison rather than two different clips.
+    """
+    info = bundle.shard_set.info
+    model_cfg = world_model_cfg(info)
+    kind = model_cfg["kind"]
+    config = load_config(model_cfg["config"])
+    checkpoint = resolve_checkpoint(model_cfg, config)
+    is_goal_model = kind == "goal_world_model"
+
+    # Build once to learn `step_seconds`, then set the step count directly rather than
+    # back-solving a horizon in seconds, which would round.
+    geom = build_geometry_for(
+        {**model_cfg, "goal_lead_seconds": settings.goal_lead_seconds if is_goal_model else None},
+        config,
+        horizon_seconds=1.0,
+    )
+    geom = replace(geom, num_steps=int(num_steps))
+    # The geometry carries the goal's read-ahead; the schedule itself is applied per
+    # trace, so the two goal regimes see identically laid-out clips.
+    schedule = build_goal_schedule(config, settings.goal_lead_seconds) if is_goal_model else None
+
+    if info.crop_size != geom.crop_size:
+        raise SystemExit(
+            f"{bundle.name}: the decoder was trained at crop {info.crop_size} but "
+            f"{model_cfg['config']} builds clips at crop {geom.crop_size}; the rollout would produce "
+            "latents of a different image."
+        )
+
+    # `prepare_bundle` with the goal withheld is also the check that the null-goal path
+    # was ever trained (it refuses a run with goal_drop_prob = 0). The goal-conditioned
+    # trace then just attaches the schedule to the same weights.
+    wm = prepare_bundle({**model_cfg, "goal_lead_seconds": None}, config, checkpoint, device)
+    if wm.embed_dim != bundle.latent_dim:
+        raise SystemExit(
+            f"{bundle.name}: {checkpoint} emits latents of width {wm.embed_dim} but the decoder was "
+            f"trained on {bundle.latent_dim}; the shard set and the decoder disagree about the world model."
+        )
+    autocast_kwargs = autocast_config(config, device, settings.use_amp)
+
+    normalization = info.manifest["normalization"]
+    target_frame = str(info.manifest.get("target_frame_in_tubelet", "last"))
+    transform = make_transforms(
+        training=False,
+        crop_size=geom.crop_size,
+        num_views_per_clip=1,
+        normalize=tuple(tuple(v) for v in normalization),
+    )
+
+    dataset_csv = settings.dataset_csv or info.manifest.get("dataset_csv")
+    if not dataset_csv:
+        raise SystemExit(
+            f"{bundle.name}: the shard manifest records no dataset_csv; pass --rollout-dataset-csv."
+        )
+    videos = select_videos(load_manifest(dataset_csv), {bundle.name: geom}, settings.clip_index + 1)
+    if len(videos) <= settings.clip_index:
+        raise SystemExit(
+            f"{bundle.name}: {dataset_csv} holds only {len(videos)} video(s) long enough for a "
+            f"{geom.horizon_seconds:.1f}s rollout at {geom.sampling_fps:g} fps, so --rollout-clip-index "
+            f"{settings.clip_index} does not exist."
+        )
+    row_idx, video_path = videos[settings.clip_index]
+
+    loaded = load_long_clip(video_path, geom, transform, np.random.default_rng(settings.seed + row_idx))
+    if loaded is None:
+        raise SystemExit(f"{bundle.name}: could not decode a rollout clip from {video_path}")
+    clip, start_frame = loaded
+    clip = clip.unsqueeze(0).to(device, non_blocking=True)
+
+    unit = geom.tubelet_size
+    clip_cpu = clip.squeeze(0).cpu()
+    # Unit `window_tokens - 1` is the last one the context covers, and unit
+    # `window_tokens + k` is what step k predicts - index-for-index the layout
+    # `encode_ground_truth` and `latent_cache` use.
+    observed = to_uint8(frame_in_tubelet(clip_cpu, geom.window_tokens - 1, unit, target_frame), normalization)
+    offset = unit - 1 if target_frame == "last" else 0
+    truth = _frames_uint8(
+        clip_cpu, [(geom.window_tokens + k) * unit + offset for k in range(geom.num_steps)], normalization
+    )
+
+    # (label, filename suffix, goal lead). One regime for an ordinary world model; two
+    # for the goal-conditioned one, which is the whole point of running it twice.
+    if is_goal_model:
+        regimes: List[Tuple[str, str, Optional[float]]] = [
+            ("goal withheld (null goal)", "no-goal", None),
+            (f"goal supplied {schedule.lead_seconds:g}s ahead", "goal", schedule.lead_seconds),
+        ]
+    else:
+        regimes = [("autoregressive rollout", "", None)]
+
+    traces: List[RolloutTrace] = []
+    for label, suffix, lead in regimes:
+        goals = None
+        goal_frames = None
+        if lead is not None:
+            goals = encode_goals(wm, geom, clip, schedule, autocast_kwargs)
+            goal_frames = _frames_uint8(
+                clip_cpu,
+                [schedule.first_frame + k * schedule.frames_per_chunk + offset for k in range(geom.num_steps)],
+                normalization,
+            )
+        latents = rollout_latents(
+            wm,
+            geom,
+            clip,
+            settings.feedback,
+            settings.mask_token_index,
+            autocast_kwargs,
+            goals,
+            None if schedule is None else schedule.position,
+        )
+        traces.append(
+            RolloutTrace(
+                label=label,
+                suffix=suffix,
+                latents=latents,
+                observed=observed,
+                truth=truth,
+                step_seconds=geom.step_seconds,
+                video_path=video_path,
+                start_frame=int(start_frame),
+                goals=goal_frames,
+                goal_lead_seconds=lead,
+            )
+        )
+        logger.info(
+            "panel 4 (%s): rolled %d step(s) of %.2fs each [%s] on %s",
+            bundle.name,
+            latents.size(0),
+            geom.step_seconds,
+            label,
+            Path(video_path).name,
+        )
+
+    del wm, clip
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return traces
+
+
+# --------------------------------------------------------------------------- #
 # Panel 4: lead-time ladder
 # --------------------------------------------------------------------------- #
 
@@ -595,19 +934,24 @@ def panel_lead_time(
     settings: SamplerSettings,
     output_dir: Path,
     device: str,
-    rollout_latents: Optional[Path],
+    rollout: RolloutSettings,
+    rollout_file: Optional[Path],
     max_steps: int,
 ) -> dict:
-    """Consecutive one-step targets of one clip, or caller-supplied rollout latents.
+    """Consecutive one-step targets of one clip, or an autoregressive rollout.
 
     The two cases are labelled differently on purpose. Consecutive cached steps
     are each a *fresh* one-step problem from real context - difficulty rises only
-    because the scene moves. Rollout latents compound the world model's own error,
+    because the scene moves. A rollout compounds the world model's own error,
     which is a different and much harder question; conflating them would flatter
     the world model.
     """
-    if rollout_latents is not None:
-        return _panel_lead_time_rollout(bundle, codec, settings, output_dir, device, rollout_latents, max_steps)
+    if rollout.enabled:
+        return _panel_lead_time_rollout(bundle, codec, settings, output_dir, device, rollout, max_steps)
+    if rollout_file is not None:
+        return _panel_lead_time_rollout_file(
+            bundle, codec, settings, output_dir, device, rollout_file, max_steps
+        )
 
     # Group cached samples by clip and take the longest run of consecutive steps.
     by_clip: Dict[int, List[int]] = {}
@@ -639,8 +983,7 @@ def panel_lead_time(
         caption=(
             f"Clip {clip_id}, consecutive one-step targets. Each column is an INDEPENDENT one-step problem "
             "from real context, so this shows how scene difficulty varies along a clip - it is NOT an "
-            "autoregressive rollout. Pass --rollout-latents for that; this harness never rolls a world "
-            f"model forward itself. {settings.describe()}."
+            f"autoregressive rollout. Pass --rollout-latents for that. {settings.describe()}."
         ),
     )
     logger.info(
@@ -654,7 +997,109 @@ def panel_lead_time(
 
 
 @torch.no_grad()
+def _decode_rollout_trace(
+    bundle: DecoderBundle,
+    codec,
+    settings: SamplerSettings,
+    output_dir: Path,
+    device: str,
+    trace: RolloutTrace,
+    feedback: str,
+) -> dict:
+    """One figure for one rollout: truth, the decoded rollout, and any goal frames.
+
+    Every latent is decoded against the LAST OBSERVED frame - never against the
+    previous step's truth or its own previous sample - so nothing downstream of the
+    world model gets refreshed as the row advances. Degradation along the row is then
+    the world model compounding its own error, which is the only thing this figure is
+    allowed to be read as.
+    """
+    observed = frames_to_unit(trace.observed.unsqueeze(0).to(device))
+    truth = frames_to_unit(trace.truth.to(device))
+
+    decoded_row = [
+        to_numpy_image(decode(bundle, codec, observed, trace.latents[k].unsqueeze(0).to(device), settings)[0])
+        for k in range(trace.num_steps)
+    ]
+
+    # The last observed frame leads every row: it is where the rollout starts, and it is
+    # what every sample to its right was decoded against. `save_panel` only blanks cells
+    # *after* the end of a short row, so the rows that have nothing to show in that
+    # column are padded with a flat grey rather than left ragged, which would shift the
+    # whole row one column out of step with its own truth.
+    first = to_numpy_image(observed[0])
+    pad = np.full_like(first, 0.5)
+
+    rows = [[first] + [to_numpy_image(truth[k]) for k in range(trace.num_steps)], [pad] + decoded_row]
+    row_labels = ["truth", "D(x_obs, z_k)" if bundle.decoder.uses_frame_conditioning else "D(z_k)"]
+    if trace.goals is not None:
+        goals = frames_to_unit(trace.goals.to(device))
+        rows.append([pad] + [to_numpy_image(goals[k]) for k in range(trace.num_steps)])
+        row_labels.append(f"goal (+{trace.goal_lead_seconds:g}s)")
+
+    suffix = f"-{trace.suffix}" if trace.suffix else ""
+    path = output_dir / f"panel4-rollout-{slug(bundle.name)}{suffix}.png"
+    goal_note = (
+        ""
+        if trace.goal_lead_seconds is None
+        else (
+            f" The goal is held {trace.goal_lead_seconds:g}s ahead of the sliding context window, so it is "
+            "read from real video PAST the rollout's own frontier - this row is privileged, and is a "
+            "ceiling rather than a measurement."
+        )
+    )
+    save_panel(
+        rows,
+        row_labels,
+        ["x_obs\n(last seen)"]
+        + [f"k = {k + 1}\n+{(k + 1) * trace.step_seconds:g}s" for k in range(trace.num_steps)],
+        path,
+        f"Panel 4 - autoregressive rollout ({trace.label}): {bundle.name}",
+        caption=(
+            f"{trace.num_steps} step(s) of {trace.step_seconds:g}s on {Path(trace.video_path).name} "
+            f"@ frame {trace.start_frame}, `{feedback}` feedback. The predictor is fed its own output at "
+            "every step and every latent is decoded against the LAST OBSERVED frame, so decay along the "
+            f"row is the world model's compounding error, not the decoder's.{goal_note} "
+            f"{settings.describe()}."
+        ),
+    )
+    return {
+        "path": path,
+        "label": trace.label,
+        "num_steps": trace.num_steps,
+        "step_seconds": trace.step_seconds,
+        "horizon_seconds": trace.num_steps * trace.step_seconds,
+        "video": Path(trace.video_path).name,
+        "goal_lead_seconds": trace.goal_lead_seconds,
+    }
+
+
+@torch.no_grad()
 def _panel_lead_time_rollout(
+    bundle: DecoderBundle,
+    codec,
+    settings: SamplerSettings,
+    output_dir: Path,
+    device: str,
+    rollout: RolloutSettings,
+    max_steps: int,
+) -> dict:
+    """Roll this bundle's own world model forward and decode what it emits.
+
+    One figure per conditioning regime: one for an ordinary world model, two for the
+    goal-conditioned chunk model (goal withheld, and goal supplied at a fixed lead).
+    """
+    traces = run_rollouts(bundle, rollout, max_steps, device)
+    figures = [
+        _decode_rollout_trace(bundle, codec, settings, output_dir, device, trace, rollout.feedback)
+        for trace in traces
+    ]
+    logger.info("panel 4 (%s): wrote %d rollout figure(s)", bundle.name, len(figures))
+    return {"mode": "rollout", "feedback": rollout.feedback, "figures": figures}
+
+
+@torch.no_grad()
+def _panel_lead_time_rollout_file(
     bundle: DecoderBundle,
     codec,
     settings: SamplerSettings,
@@ -663,13 +1108,13 @@ def _panel_lead_time_rollout(
     rollout_path: Path,
     max_steps: int,
 ) -> dict:
-    """Decode caller-supplied rollout latents.
+    """Decode caller-supplied rollout latents instead of rolling the model here.
 
     Expected file: a torch save with `latents` (K, S, d_m) - one latent per
     autoregressive step, in order - and `frame_prev` (3, H, W) uint8, the last
     frame the world model actually observed. Optional `truth` (K, 3, H, W) uint8
-    for a comparison row. Producing this file is the caller's job (see
-    `evals/generate_world_model_report.py`, which already does the rollout).
+    for a comparison row. Kept for latents produced somewhere other than this repo;
+    `--rollout-latents` is the path of least surprise.
     """
     payload = torch.load(rollout_path, map_location="cpu", weights_only=False)
     latents = payload["latents"].float()[:max_steps]
@@ -692,7 +1137,7 @@ def _panel_lead_time_rollout(
     rows.append(decoded_row)
     row_labels.append("D(x_t_obs, z_k)")
 
-    path = output_dir / f"panel4-rollout-{slug(bundle.name)}.png"
+    path = output_dir / f"panel4-rollout-file-{slug(bundle.name)}.png"
     save_panel(
         rows,
         row_labels,
@@ -706,7 +1151,7 @@ def _panel_lead_time_rollout(
         ),
     )
     logger.info("panel 4 (%s): decoded %d rollout latent(s) from %s", bundle.name, latents.size(0), rollout_path)
-    return {"path": path, "mode": "rollout", "num_steps": int(latents.size(0)), "source": str(rollout_path)}
+    return {"path": path, "mode": "rollout_file", "num_steps": int(latents.size(0)), "source": str(rollout_path)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1049,8 +1494,11 @@ def write_report(
         "regions of the std map are pixels the latent did not determine. Needs no ground truth, which makes "
         "it the panel to trust when the truth is ambiguous.",
         "lead_time": "**Panel 4 - lead time.** Legibility against prediction distance. Teacher-forced by "
-        "default (each column an independent one-step problem); with `--rollout-latents`, the caller's "
-        "autoregressive latents, where degradation is the world model compounding its own error.",
+        "default (each column an independent one-step problem); with `--rollout-latents`, a true "
+        "autoregressive rollout of the shard set's own world model, where the predictor is fed its own "
+        "output and degradation along the row is that model compounding its own error. The "
+        "goal-conditioned model gets two figures - goal withheld and goal supplied at a fixed lead - on "
+        "the same clip and the same context, so the pair isolates what the goal buys.",
         "token_ablation": "**Panel 5 - token ablation.** Replace a block of latent tokens with the "
         "no-information token and re-decode from the same seed. A tight difference map over the block's own "
         "region means tokens still govern where they sit.",
@@ -1064,18 +1512,35 @@ def write_report(
             continue
         lines += ["", f"## {panel}", "", descriptions[panel], ""]
         for name, result in results[panel].items():
-            if not result or "path" not in result:
+            # A panel may emit more than one figure for one run - the goal-conditioned
+            # rollout emits two - so every result is read as a list of figures, with a
+            # single-figure result being the one-element case.
+            figures = result.get("figures") or ([result] if "path" in result else [])
+            if not figures:
                 continue
-            relative = Path(result["path"]).name
             lines.append(f"### {name}" if name != "__all__" else "")
-            numbers = ", ".join(
+            shared = ", ".join(
                 f"{k} = {v:.4f}" if isinstance(v, float) else f"{k} = {v}"
                 for k, v in result.items()
-                if k != "path" and not isinstance(v, (list, dict))
+                if k not in ("path", "figures") and not isinstance(v, (list, dict))
             )
-            if numbers:
-                lines.append(f"{numbers}")
-            lines += ["", f"![{panel} {name}]({relative})", ""]
+            if shared:
+                lines.append(shared)
+            for figure in figures:
+                if "path" not in figure:
+                    continue
+                relative = Path(figure["path"]).name
+                label = figure.get("label")
+                if label and len(figures) > 1:
+                    lines += ["", f"**{label}**"]
+                numbers = ", ".join(
+                    f"{k} = {v:.4f}" if isinstance(v, float) else f"{k} = {v}"
+                    for k, v in figure.items()
+                    if k not in ("path", "label") and v is not None and not isinstance(v, (list, dict))
+                )
+                if numbers:
+                    lines += ["", numbers]
+                lines += ["", f"![{panel} {name} {label or ''}]({relative})", ""]
 
     lines += [
         "## How to read a null result",
@@ -1178,10 +1643,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lead-time-steps", type=int, default=6, help="Maximum columns in panel 4.")
     parser.add_argument(
         "--rollout-latents",
+        action="store_true",
+        help="Turn panel 4 into a true autoregressive rollout: rebuild each shard set's own world model "
+        "from its manifest, roll it --lead-time-steps steps forward feeding it its own predictions, and "
+        "decode what it emits. The goal-conditioned chunk model produces two figures on the same clip - "
+        "goal withheld, and goal supplied --rollout-goal-lead-seconds ahead.",
+    )
+    parser.add_argument(
+        "--rollout-latents-file",
         default=None,
-        help="Optional torch file of caller-supplied autoregressive rollout latents for panel 4 "
-        "(keys: latents (K, S, d_m), frame_prev (3, H, W) uint8, optional truth (K, 3, H, W) uint8). "
-        "This harness never rolls a world model forward itself.",
+        help="Instead of rolling the model here, decode caller-supplied rollout latents from a torch file "
+        "(keys: latents (K, S, d_m), frame_prev (3, H, W) uint8, optional truth (K, 3, H, W) uint8). For "
+        "latents produced outside this repo; --rollout-latents is the usual route.",
+    )
+    parser.add_argument(
+        "--rollout-feedback",
+        choices=ROLLOUT_FEEDBACK_MODES,
+        default="rescale",
+        help="How a prediction is mapped back into the predictor's input space between steps; see "
+        "evals/generate_world_model_report.py. The oracle mode is not offered here - it rescales by the "
+        "statistics of the frame being predicted, so the decoded latent would have read the future.",
+    )
+    parser.add_argument(
+        "--rollout-goal-lead-seconds",
+        type=float,
+        default=DEFAULT_GOAL_LEAD_SECONDS,
+        help="Lead at which the goal-conditioned model's second rollout is handed its goal. Must lie in "
+        "the world_model.goal_min_seconds..goal_max_seconds range the model was trained on, or the figure "
+        "would be measuring extrapolation.",
+    )
+    parser.add_argument(
+        "--rollout-dataset-csv",
+        default=None,
+        help="Manifest of long videos to roll out on. Defaults to the one each shard set was cached from, "
+        "which is the held-out split its decoder never saw.",
+    )
+    parser.add_argument(
+        "--rollout-clip-index",
+        type=int,
+        default=0,
+        help="Which of the videos long enough for the rollout to use.",
+    )
+    parser.add_argument(
+        "--rollout-seed",
+        type=int,
+        default=42,
+        help="Seed for the rollout clip's start offset. Independent of --seed, which is the decoder's "
+        "noise seed and is held fixed across every comparison.",
+    )
+    parser.add_argument(
+        "--rollout-no-amp",
+        dest="rollout_use_amp",
+        action="store_false",
+        default=True,
+        help="Roll the world model out in fp32 instead of the dtype its config was trained in.",
     )
     parser.add_argument(
         "--raw-weights",
@@ -1240,6 +1755,21 @@ def main() -> None:
         raise SystemExit("no usable eval sample indices")
     logger.info("using eval indices %s (smallest shard set holds %d sample(s))", indices, smallest)
 
+    rollout = RolloutSettings(
+        enabled=bool(args.rollout_latents),
+        feedback=args.rollout_feedback,
+        goal_lead_seconds=args.rollout_goal_lead_seconds,
+        dataset_csv=args.rollout_dataset_csv,
+        clip_index=args.rollout_clip_index,
+        seed=args.rollout_seed,
+        use_amp=args.rollout_use_amp,
+    )
+    if rollout.enabled and args.rollout_latents_file:
+        raise SystemExit(
+            "--rollout-latents rolls the world model forward here and --rollout-latents-file decodes "
+            "latents rolled out elsewhere; pass one or the other."
+        )
+
     settings = SamplerSettings(
         num_steps=args.num_steps,
         guidance=args.guidance,
@@ -1276,7 +1806,8 @@ def main() -> None:
                 settings,
                 output_dir,
                 device,
-                Path(args.rollout_latents) if args.rollout_latents else None,
+                rollout,
+                Path(args.rollout_latents_file) if args.rollout_latents_file else None,
                 args.lead_time_steps,
             )
         if "token_ablation" in wanted:
