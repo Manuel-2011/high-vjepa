@@ -3,8 +3,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import logging
 import sys
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -29,6 +31,135 @@ def _clean_backbone_keys(state_dict, drop_pos_embed):
             continue
         cleaned[k] = v
     return cleaned
+
+
+def strip_ddp_prefix(state_dict):
+    """Training saves DDP-wrapped modules, so every key carries a `module.` prefix that
+    the bare modules built here do not have."""
+    return {(k[len("module.") :] if k.startswith("module.") else k): v for k, v in state_dict.items()}
+
+
+@dataclass
+class GoalWorldModel:
+    """A trained goal-conditioned chunk world model, ready to run.
+
+    `encoder`/`target_encoder` are `ChunkWindowEncoder`s: pixels in, one latent per
+    chunk out. The predictor consumes the online encoder's latents (that is what it was
+    trained on) and the target encoder is what produced its goals and its targets, so a
+    goal built for it has to come from that one.
+    """
+
+    encoder: nn.Module
+    target_encoder: nn.Module
+    predictor: nn.Module
+    embed_dim: int
+    tokens_per_chunk: int
+    frames_per_chunk: int
+    context_chunks: int
+    patches_per_chunk: int
+    epoch: int
+
+    def goal_position(self, goal_lead_seconds, fps):
+        """Where a goal that far past the end of the context sits, in the predictor's own
+        chunk units - the same `goal_pos` training computes for a goal at that distance."""
+        return self.context_chunks + (goal_lead_seconds * fps) / self.frames_per_chunk
+
+
+def load_goal_world_model(config, checkpoint, device, freeze=True, use_activation_checkpointing=False):
+    """Rebuild a goal-conditioned chunk world model from its training config and load it.
+
+    `config` is the parsed `app: world_model` yaml the checkpoint was trained with, so
+    every architectural choice comes from the run itself rather than being restated by
+    the caller.
+
+    The frozen V-JEPA 2 backbone is shared between the online and target encoders rather
+    than duplicated: it is frozen and identical in both, and a second ViT-L would cost a
+    gigabyte for nothing.
+    """
+    cfgs_data = config["data"]
+    cfgs_model = config["model"]
+    cfgs_meta = config.get("meta", {})
+    cfgs_wm = config["world_model"]
+    cfgs_vjepa = config["vjepa"]
+
+    crop_size = int(cfgs_data.get("crop_size", 256))
+    patch_size = int(cfgs_vjepa.get("patch_size", 16))
+    tubelet_size = int(cfgs_vjepa.get("tubelet_size", 2))
+    tokens_per_chunk = int(cfgs_wm.get("tokens_per_chunk", 4))
+    context_chunks = int(cfgs_wm.get("context_chunks", 8))
+    frames_per_chunk = tokens_per_chunk * tubelet_size
+    grid = crop_size // patch_size
+
+    vjepa = init_frozen_backbone(
+        device=device,
+        checkpoint=cfgs_vjepa["checkpoint"],
+        checkpoint_key=cfgs_vjepa.get("checkpoint_key", "target_encoder"),
+        model_name=cfgs_vjepa.get("model_name", "vit_large"),
+        crop_size=crop_size,
+        patch_size=patch_size,
+        tubelet_size=tubelet_size,
+        frames_per_chunk=frames_per_chunk,
+        uniform_power=cfgs_vjepa.get("uniform_power", False),
+        use_rope=cfgs_vjepa.get("use_rope", True),
+        use_sdpa=cfgs_meta.get("use_sdpa", False),
+        use_silu=cfgs_vjepa.get("use_silu", False),
+        wide_silu=cfgs_vjepa.get("wide_silu", True),
+    )
+
+    encoder, predictor = init_world_model(
+        device=device,
+        frozen_dim=vjepa.embed_dim,
+        grid_height=grid,
+        grid_width=grid,
+        tokens_per_chunk=tokens_per_chunk,
+        context_chunks=context_chunks,
+        embed_dim=cfgs_model.get("embed_dim", 768),
+        enc_depth=cfgs_model.get("enc_depth", 6),
+        enc_num_heads=cfgs_model.get("enc_num_heads", 12),
+        pred_depth=cfgs_model.get("pred_depth", 12),
+        pred_embed_dim=cfgs_model.get("pred_embed_dim", 384),
+        pred_num_heads=cfgs_model.get("pred_num_heads", 12),
+        goal_gate_init=cfgs_model.get("goal_gate_init", 1.0),
+        horizon_embed_dim=cfgs_model.get("horizon_embed_dim", 128),
+        use_sdpa=cfgs_meta.get("use_sdpa", False),
+        use_silu=cfgs_model.get("use_silu", False),
+        use_pred_silu=cfgs_model.get("use_pred_silu", False),
+        wide_silu=cfgs_model.get("wide_silu", True),
+        use_activation_checkpointing=use_activation_checkpointing,
+    )
+    target_encoder = copy.deepcopy(encoder)
+
+    # Load into the bare modules, before any wrapping, so the keys line up with what
+    # training saved.
+    ckpt = robust_checkpoint_loader(checkpoint, map_location=torch.device("cpu"))
+    epoch = int(ckpt.get("epoch", 0))
+    load_module_state_dict(encoder, strip_ddp_prefix(ckpt["encoder"]), "chunk encoder", epoch)
+    load_module_state_dict(predictor, strip_ddp_prefix(ckpt["predictor"]), "predictor", epoch)
+    load_module_state_dict(
+        target_encoder, strip_ddp_prefix(ckpt["target_encoder"]), "target chunk encoder", epoch
+    )
+    del ckpt
+
+    backbone_batch_size = int(cfgs_vjepa.get("batch_size", -1))
+    model = GoalWorldModel(
+        encoder=ChunkWindowEncoder(vjepa, encoder, frames_per_chunk, backbone_batch_size),
+        target_encoder=ChunkWindowEncoder(vjepa, target_encoder, frames_per_chunk, backbone_batch_size),
+        predictor=predictor,
+        embed_dim=int(encoder.embed_dim),
+        tokens_per_chunk=tokens_per_chunk,
+        frames_per_chunk=frames_per_chunk,
+        context_chunks=context_chunks,
+        patches_per_chunk=grid * grid,
+        epoch=epoch,
+    )
+
+    for module in (model.encoder, model.target_encoder, model.predictor):
+        module.to(device)
+        if freeze:
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+    return model
 
 
 def init_frozen_backbone(

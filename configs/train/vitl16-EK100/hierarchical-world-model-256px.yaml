@@ -1,0 +1,111 @@
+# Hierarchical world model. Both levels start predicting from the same instant T, 16s
+# into the clip: the frozen goal-conditioned model rolls out a plan in 2s chunks toward a
+# goal 16s past T, and a causal V-JEPA 2 predictor trained here fills in the 0.5s steps,
+# switching to the next chunk of the plan every four of its own steps.
+#
+# Only the low-level predictor is trained. The low-level encoder, and the whole
+# high-level model, are frozen.
+app: hierarchical_world_model
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 16
+mem_per_gpu: 40G
+folder: preliminary_experiments/EK100-hierarchical-wm-256px
+data:
+  # Same window dataset as the high-level run: every window of every video is a sample.
+  datasets:
+  - data/ek55_processed/train
+  - data/ek100-processed
+  index_cache: data/wm_window_index.json
+  distinct_videos_per_batch: true
+  batch_size: 2
+  crop_size: 256
+  fps: 4
+  num_workers: 8
+  persistent_workers: true
+  pin_mem: true
+  # Hop between consecutive windows of a video, in chunks. T sits at a fixed point in the
+  # clip, so the low-level model only trains on the window around it; hopping by exactly
+  # that window (guidance_chunks + 1) tiles each video's footage. This costs nothing per
+  # step -- a clip is decoded whole either way -- it just makes an epoch longer, so cap
+  # it with optimization.ipe if you want shorter ones.
+  window_stride_chunks: 2
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+loss:
+  loss_exp: 1.0
+meta:
+  dtype: bfloat16
+  load_checkpoint: true
+  read_checkpoint: null
+  save_every_freq: 10
+  seed: 239
+  use_sdpa: true
+high_level:
+  # The frozen planner. Its own training config fixes its architecture, so the two
+  # halves of the hierarchy can never be assembled mismatched.
+  config: configs/train/vitl16-EK100/world-model-goal-256px.yaml
+  checkpoint: preliminary_experiments/EK100-world-model-goal-256px/latest.pt
+  # A single fixed goal that far past T, as if holding a photograph of where the activity
+  # is heading. Must lie in the range the high-level model was trained to place goals in
+  # (4-16s).
+  goal_seconds: 16.0
+  # Chunks the high-level model rolls forward from T -- how far the plan reaches, and so
+  # how many sub-goals the low-level model is handed. 1 means it is conditioned on a
+  # single goal, the nearest high-level step: the 2s chunk its next four steps are
+  # predicting their way into. The low-level window is one chunk longer than this (a
+  # lead-in chunk, whose own steps run unconditioned), so 1 gives a 16-frame low-level
+  # clip, the same length pretrain-causal-4fps-original-vjepa2-ckpt.yaml trains on.
+  # Raising it costs quickly: the causal attention-mask buffers alone are ~150MB at 1,
+  # ~340MB at 2, ~600MB at 3 and ~3GB at 8, and attention grows quadratically with them.
+  guidance_chunks: 1
+  # Per-channel gate on the sub-goal cross-attention. Zero-initialized, so a predictor
+  # warm-started from a plain V-JEPA 2 one starts out as exactly that model and has to
+  # learn to open the gate. Watch the `xattn-gate` column to see whether it does.
+  gate_init: 0.0
+  # How many sub-goals a step may read, counting back from the chunk it is predicting
+  # into. 1 is the switching schedule: four steps on sub-goal 0, then four on sub-goal 1,
+  # and so on, each step seeing only its own. Raise it to let a step keep the sub-goals it
+  # has already passed; null lets every step see the whole plan at once.
+  window: 1
+encoder:
+  # Frozen low-level encoder. It is run causally, and the released V-JEPA 2 weights were
+  # pretrained bidirectionally -- prefer a causally post-trained checkpoint when one
+  # exists (see pretrain-causal-4fps-original-vjepa2-ckpt.yaml).
+  checkpoint: models/vitl.pt
+  checkpoint_key: target_encoder
+  model_name: vit_large
+  patch_size: 16
+  tubelet_size: 2
+  uniform_power: true
+  use_rope: true
+model:
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  use_activation_checkpointing: true
+  # Unused when causal; only sizes the predictor's mask-token list.
+  num_mask_tokens: 4
+  # Initialize the trainable predictor from an existing V-JEPA 2 predictor. The sub-goal
+  # cross-attention does not exist there and stays freshly initialized. Set to null to
+  # train the predictor from scratch.
+  warm_start: models/vitl.pt
+  warm_start_key: predictor
+optimization:
+  epochs: 50
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04
+  ipe: null
+  ipe_scale: 1.25
+  lr: 0.000525
+  start_lr: 0.0001
+  warmup: 2
+  weight_decay: 0.04

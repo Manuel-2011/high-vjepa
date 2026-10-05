@@ -53,6 +53,7 @@ class VisionTransformerPredictor(nn.Module):
         guidance_gate_init=0.0,
         guidance_step_ratio=4,
         guidance_window=None,
+        guidance_context_offset=0,
         **kwargs
     ):
         super().__init__()
@@ -68,6 +69,13 @@ class VisionTransformerPredictor(nn.Module):
         self.guidance_step_ratio = guidance_step_ratio
         # Number of most-recent guidance steps a token may read (None -> every past one)
         self.guidance_window = guidance_window
+        # How far past `R * l` the context of guidance element `l` actually reaches, in
+        # steps of *this* model. 0 is the subsampled case (the guidance model saw only
+        # the leading frames of each of its steps, so its context ends at R*l). A
+        # guidance model that consumes every frame of step `l` has seen up to R*(l+1),
+        # which is `R - 1` steps further, and reading it any earlier would leak frames
+        # this model has not observed. See `build_guidance_positions`.
+        self.guidance_context_offset = guidance_context_offset
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -219,9 +227,20 @@ class VisionTransformerPredictor(nn.Module):
         gets a relative offset of 3 steps.
 
         Causality is preserved by only letting token `s` read guidance token `l` when the
-        guidance model's *context* ends no later than this model's, i.e. `R * l <= s`.
-        Guidance latents are predictions rather than observations, so nothing about the
-        future leaks as long as that holds.
+        guidance model's *context* ends no later than this model's, i.e.
+        `R * l + guidance_context_offset <= s`. Guidance latents are predictions rather
+        than observations, so nothing about the future leaks as long as that holds.
+
+        The offset is what the guidance model's own context actually covers. A guidance
+        model that only samples the leading frames of each of its steps has seen up to
+        `R * l` when it emits element `l`, so the offset is 0. One that consumes *every*
+        frame of its step - a chunk encoder, say - has seen up to `R * (l + 1)` by then,
+        so element `l` only becomes safe `R - 1` steps later; passing offset 0 there
+        would hand this model up to `R - 1` steps of future it never observed.
+
+        A row of the mask can come out empty - the earliest few steps may have no
+        guidance that is safe to read yet - and `CrossRoPEAttention` returns zero for
+        those queries rather than NaN.
 
         :return: (q_pos, k_pos, xattn_mask)
         """
@@ -250,7 +269,7 @@ class VisionTransformerPredictor(nn.Module):
         )
 
         # -- [N_q, N_k] bool mask, True where the guidance token is readable
-        lag = q_step.unsqueeze(1) - R * k_step.unsqueeze(0)
+        lag = q_step.unsqueeze(1) - (R * k_step.unsqueeze(0) + self.guidance_context_offset)
         xattn_mask = lag >= 0
         if self.guidance_window is not None:
             xattn_mask = xattn_mask & (lag < R * self.guidance_window)

@@ -707,7 +707,9 @@ class CrossRoPEAttention(nn.Module):
         :param mem: [B, M, kv_dim] memory (guidance) tokens
         :param q_pos: triplet of [N] float tensors with the (t, h, w) position of each query
         :param k_pos: triplet of [M] float tensors with the (t, h, w) position of each memory token
-        :param attn_mask: [N, M] bool tensor, True where a query may read a memory token
+        :param attn_mask: [N, M] bool tensor, True where a query may read a memory token.
+            A row may be entirely False - a query with nothing it is allowed to read yet -
+            and that query's output is zero, so the gated residual leaves it untouched.
         """
         B, N, C = x.shape
 
@@ -717,6 +719,16 @@ class CrossRoPEAttention(nn.Module):
 
         q = self._rotate(q, q_pos)
         k = self._rotate(k, k_pos)
+
+        # An all-False row would softmax over an all -inf row and come back NaN, which
+        # would then poison the whole batch through the residual. Let such a query attend
+        # everywhere (its result is thrown away below) and zero its output instead.
+        empty_rows = None
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            readable = attn_mask.any(dim=-1, keepdim=True)
+            if not bool(readable.all()):
+                empty_rows = ~readable
+                attn_mask = attn_mask | empty_rows
 
         if self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
@@ -735,6 +747,10 @@ class CrossRoPEAttention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        # After the projection, so that a query with nothing to read gets exactly zero
+        # rather than `proj`'s bias: the branch is then truly absent for that query.
+        if empty_rows is not None:
+            x = x.masked_fill(empty_rows, 0.0)
         return x
 
 
