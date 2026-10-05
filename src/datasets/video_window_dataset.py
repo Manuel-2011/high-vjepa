@@ -121,8 +121,12 @@ class VideoWindowDataset(torch.utils.data.Dataset):
         self.window_starts = []
         self.window_steps = []
         num_short = 0
+        num_unreadable = 0
         for path in files:
             num_frames, video_fps = probed[path]
+            if num_frames <= 0:
+                num_unreadable += 1
+                continue
             frame_step = 1 if fps is None else max(1, int(round(video_fps / fps)))
             span = (clip_frames - 1) * frame_step + 1  # source frames one window covers
             if num_frames < span:
@@ -135,10 +139,7 @@ class VideoWindowDataset(torch.utils.data.Dataset):
                 self.window_starts.append(start)
                 self.window_steps.append(frame_step)
         if not self.window_starts:
-            raise ValueError(
-                f"no video is long enough for a {clip_frames}-frame window at {fps}fps "
-                f"(shortest requirement: {clip_frames / (fps or 1):.1f}s of footage)"
-            )
+            raise ValueError(self._nothing_usable_message(files, probed, num_unreadable))
 
         self.window_video_ids = np.asarray(self.window_video_ids, dtype=np.int64)
         self.window_starts = np.asarray(self.window_starts, dtype=np.int64)
@@ -147,8 +148,43 @@ class VideoWindowDataset(torch.utils.data.Dataset):
         logger.info(
             f"VideoWindowDataset: {len(self.window_starts)} windows of {clip_frames} frames "
             f"(stride {stride_frames}) over {len(self.videos)} videos ({total_hours:.1f}h of footage); "
-            f"skipped {num_short} video(s) shorter than one window"
+            f"skipped {num_short} video(s) shorter than one window and {num_unreadable} unreadable"
         )
+
+    def _nothing_usable_message(self, files, probed, num_unreadable):
+        """Say *why* nothing was usable. A bare "no video is long enough" is a dead end
+        when the collection obviously does contain long videos, and the usual causes --
+        videos that would not open, or a container reporting a frame rate that inflates
+        the stride - are invisible without the numbers."""
+        need_s = self.clip_frames / self.fps if self.fps else float("nan")
+        lines = [
+            f"no usable window in {len(files)} video(s): a window is {self.clip_frames} frames "
+            f"at {self.fps}fps = {need_s:.1f}s of footage."
+        ]
+        if num_unreadable:
+            lines.append(
+                f"{num_unreadable} of them could not be opened at all -- check the paths and that "
+                "decord can decode these files."
+            )
+        readable = [(p, probed[p][0], probed[p][1]) for p in files if probed[p][0] > 0]
+        if not readable:
+            lines.append("None of them could be opened, so none could be measured.")
+        else:
+            path, frames, video_fps = max(readable, key=lambda r: r[1] / max(r[2], 1e-9))
+            step = 1 if self.fps is None else max(1, int(round(video_fps / self.fps)))
+            span = (self.clip_frames - 1) * step + 1
+            lines.append(
+                f"The longest readable one is {path}: {frames} frames at {video_fps:g} fps "
+                f"= {frames / max(video_fps, 1e-9):.1f}s. Sampling it down to {self.fps}fps keeps "
+                f"1 frame in {step}, so one window spans {span} of its frames and it has {frames}."
+            )
+            if video_fps > 2.5 * (self.fps or 1) and span > frames:
+                lines.append(
+                    f"Note the {video_fps:g} fps: if these files are already decimated to "
+                    f"{self.fps}fps and the container is misreporting it, the stride above is "
+                    "inflated by that same factor."
+                )
+        return " ".join(lines)
 
     def __len__(self):
         return len(self.window_starts)
@@ -300,13 +336,17 @@ def _probe_videos(files, index_cache=None):
     probed, missing = {}, []
     for path in files:
         entry = cache.get(path)
-        if entry is not None:
+        # A zero-length entry is a cached failure from an older run, which used to be
+        # written here. Ignore it and probe again, so a cache poisoned once does not
+        # keep the collection empty forever.
+        if entry is not None and int(entry[0]) > 0:
             probed[path] = (int(entry[0]), float(entry[1]))
         else:
             missing.append(path)
 
     if missing:
         logger.info(f"probing {len(missing)} video(s) for length and frame rate...")
+        failed = []
         for path in missing:
             try:
                 vr = VideoReader(path, num_threads=1, ctx=cpu(0))
@@ -314,9 +354,19 @@ def _probe_videos(files, index_cache=None):
             except Exception as e:
                 warnings.warn(f"skipping unreadable video {path}: {e}")
                 probed[path] = (0, 1.0)
+                failed.append(path)
+        if failed:
+            logger.warning(
+                f"{len(failed)}/{len(missing)} video(s) could not be opened, e.g. "
+                f"{[os.path.basename(p) for p in failed[:3]]}. They are left out of the index."
+            )
         if index_cache is not None:
-            cache.update({p: list(probed[p]) for p in missing})
-            _write_index_cache(index_cache, cache)
+            # Only what was actually read. Caching a failure as "0 frames" would make a
+            # transient decode error permanent and silently empty the dataset.
+            readable = {p: list(probed[p]) for p in missing if p not in set(failed)}
+            if readable:
+                cache.update(readable)
+                _write_index_cache(index_cache, cache)
 
     return probed
 
