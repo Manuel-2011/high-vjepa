@@ -209,7 +209,7 @@ class VisionTransformerPredictor(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def build_guidance_positions(self, num_steps, num_guidance_steps, device):
+    def build_guidance_positions(self, num_steps, num_guidance_steps, device, time_shift=0):
         """Place this predictor's tokens and the guidance model's tokens on one shared
         (time, height, width) grid, and say which of the latter each of the former may read.
 
@@ -242,6 +242,14 @@ class VisionTransformerPredictor(nn.Module):
         guidance that is safe to read yet - and `CrossRoPEAttention` returns zero for
         those queries rather than NaN.
 
+        `time_shift` slides the guidance elements along the time axis. It is 0 whenever
+        this model's window and the guidance model's steps start together, which is the
+        case throughout training. An autoregressive rollout is the exception: the window
+        advances one step at a time while the guidance steps advance `R` at a time, so
+        the boundary between guidance steps drifts through the window and the shift is
+        what tracks it. Without it every rollout step would be told it is predicting the
+        *last* slice of its guidance step.
+
         :return: (q_pos, k_pos, xattn_mask)
         """
         P = self.grid_height * self.grid_width
@@ -263,19 +271,30 @@ class VisionTransformerPredictor(nn.Module):
         guidance_ids = torch.arange(num_guidance_steps, device=device)
         k_step = guidance_ids.repeat_interleave(P)
         k_pos = (
-            ((k_step + 1) * R).float(),
+            ((k_step + 1) * R + time_shift).float(),
             patch_h.repeat(num_guidance_steps),
             patch_w.repeat(num_guidance_steps),
         )
 
         # -- [N_q, N_k] bool mask, True where the guidance token is readable
-        lag = q_step.unsqueeze(1) - (R * k_step.unsqueeze(0) + self.guidance_context_offset)
+        lag = q_step.unsqueeze(1) - (
+            R * k_step.unsqueeze(0) + self.guidance_context_offset + time_shift
+        )
         xattn_mask = lag >= 0
         if self.guidance_window is not None:
             xattn_mask = xattn_mask & (lag < R * self.guidance_window)
         return q_pos, k_pos, xattn_mask
 
-    def forward(self, x, masks_x=None, masks_y=None, mask_index=1, has_cls=False, guidance=None):
+    def forward(
+        self,
+        x,
+        masks_x=None,
+        masks_y=None,
+        mask_index=1,
+        has_cls=False,
+        guidance=None,
+        guidance_time_shift=0,
+    ):
         """
         :param x: context tokens
         :param masks_x: indices of context tokens in input
@@ -355,7 +374,10 @@ class VisionTransformerPredictor(nn.Module):
                 "must use the same spatial grid as this predictor"
             )
             q_pos, k_pos, xattn_mask = self.build_guidance_positions(
-                num_steps=x.size(1) // P, num_guidance_steps=guidance.size(1) // P, device=x.device
+                num_steps=x.size(1) // P,
+                num_guidance_steps=guidance.size(1) // P,
+                device=x.device,
+                time_shift=guidance_time_shift,
             )
             guidance = self.guidance_proj(self.guidance_norm(guidance))
 

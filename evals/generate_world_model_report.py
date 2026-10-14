@@ -74,11 +74,17 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.vjepa.utils import init_video_model, load_module_state_dict
+from app.hierarchical_world_model.utils import (
+    HierarchyLayout,
+    init_low_level_model,
+    plan_sub_goals,
+)
 from app.world_model.utils import (
     ChunkRolloutPredictor,
     ChunkWindowEncoder,
     init_frozen_backbone,
     init_world_model,
+    load_goal_world_model,
 )
 from evals.generate_patch_embedding_report import (
     DEFAULT_NORMALIZATION,
@@ -122,6 +128,26 @@ EXTRA_MODELS_CONFIG = [
         "config": "configs/train/vitl16-EK100/world-model-goal-256px.yaml",
         "kind": "goal_world_model",
         "goal_lead_seconds": 16.0,
+    },
+]
+
+# The hierarchical model, with its high-level plan made once at the start of the rollout.
+# The goal-conditioned variant is PRIVILEGED twice over: the goal is a real chunk of
+# video from `goal_seconds` ahead, and at a 16s horizon that is the very interval the
+# last steps are being scored on. Read it only against its goal-withheld twin.
+EXTRA_MODELS_CONFIG += [
+    {
+        "name": "Hierarchical world model (plan, goal withheld)",
+        "checkpoint": "preliminary_experiments/EK100-hierarchical-wm-256px/latest.pt",
+        "config": "configs/train/vitl16-EK100/hierarchical-world-model-256px.yaml",
+        "kind": "hierarchical_world_model",
+    },
+    {
+        "name": "Hierarchical world model (plan toward a 16s goal)",
+        "checkpoint": "preliminary_experiments/EK100-hierarchical-wm-256px/latest.pt",
+        "config": "configs/train/vitl16-EK100/hierarchical-world-model-256px.yaml",
+        "kind": "hierarchical_world_model",
+        "use_goal": True,
     },
 ]
 
@@ -239,6 +265,11 @@ class RolloutGeometry:
     # Temporal tokens decoded past the end of the rollout, for a privileged input that
     # reads ahead of the frontier (a goal). Zero for every ordinary rollout.
     extra_tokens: int = 0
+    # Temporal tokens decoded *before* the rollout's own window, for a model that needs
+    # more history than it predicts from -- a hierarchy whose upper level conditions on a
+    # longer context than the lower one. The clip grows at the front and every index into
+    # it shifts by this much, so the rollout itself is unaffected. Zero otherwise.
+    lead_tokens: int = 0
 
     @property
     def step_seconds(self) -> float:
@@ -282,8 +313,8 @@ class RolloutGeometry:
         `context_tokens` the predictor sees, plus one extra leading token so the
         *last observed* frame also has a full ground-truth window behind it (see
         `encode_ground_truth`). `extra_tokens` covers a goal read ahead of the
-        rollout's frontier."""
-        return self.window_tokens + self.num_steps + self.extra_tokens
+        rollout's frontier, and `lead_tokens` history needed before it."""
+        return self.lead_tokens + self.window_tokens + self.num_steps + self.extra_tokens
 
     @property
     def total_sampled_frames(self) -> int:
@@ -334,6 +365,50 @@ class GoalSchedule:
 
 
 @dataclass
+class HierarchicalPlanner:
+    """The frozen high-level model, and the plan it makes for a rollout.
+
+    The plan is built once, at T -- the instant the rollout starts. The high-level model
+    has observed its full context up to T, is optionally given the latent of the chunk
+    `goal_seconds` further on, and rolls forward `plan_chunks` chunks from there. Nothing
+    after T enters it, so every low-level step may read it.
+
+    The low-level model then steps `steps_per_chunk` times inside each chunk of the plan
+    before moving on to the next, which is the schedule it was trained with.
+    """
+
+    high_level: object
+    layout: HierarchyLayout
+    use_goal: bool
+
+    @property
+    def steps_per_chunk(self) -> int:
+        return self.layout.steps_per_chunk
+
+    @property
+    def patches(self) -> int:
+        return self.layout.patches_per_chunk
+
+    @torch.no_grad()
+    def build(self, clip: torch.Tensor) -> torch.Tensor:
+        """[B, plan_chunks * P, high-level dim] -- the whole plan for this clip."""
+        return plan_sub_goals(self.high_level, clip, self.layout, use_goal=self.use_goal)
+
+    def sub_goal(self, plan: torch.Tensor, step: int):
+        """The chunk of the plan step `step` is predicting into, and the time shift that
+        tells the predictor how far into that chunk it has got.
+
+        The window slides one step at a time while the plan advances `R` at a time, so
+        the chunk boundary drifts through the window; the shift tracks it, reproducing
+        the query-to-sub-goal offset the model saw in training (0 for the first step of a
+        chunk, R-1 for the last).
+        """
+        R, P = self.steps_per_chunk, self.patches
+        index = step // R
+        return plan[:, index * P : (index + 1) * P], (R - 1) - (step % R)
+
+
+@dataclass
 class ModelBundle:
     encoder: torch.nn.Module
     predictor: torch.nn.Module
@@ -342,6 +417,8 @@ class ModelBundle:
     epoch: int
     # Set only for a goal-conditioned rollout; None means the goal is withheld.
     goal_schedule: Optional[GoalSchedule] = None
+    # Set only for a hierarchical rollout, where an upper level supplies the sub-goals.
+    planner: Optional[HierarchicalPlanner] = None
 
 
 @dataclass
@@ -590,11 +667,127 @@ def build_goal_world_model_geometry(
     )
 
 
+def hierarchy_layout(config: dict, hl_config: dict, horizon_seconds: float) -> HierarchyLayout:
+    """The chunk/step layout of a hierarchical run, with the plan stretched to cover the
+    whole rollout.
+
+    Training only ever needs `guidance_chunks` of plan because its window is that short.
+    A rollout needs enough to reach its own horizon, so the plan length here is set by
+    `horizon_seconds` instead -- the same model, asked for a longer plan.
+    """
+    cfgs_hl = config["high_level"]
+    fps = float(config["data"]["fps"])
+    tubelet = int(config["encoder"].get("tubelet_size", 2))
+    cfgs_wm = hl_config["world_model"]
+    tokens_per_chunk = int(cfgs_wm.get("tokens_per_chunk", 4))
+    frames_per_chunk = tokens_per_chunk * tubelet
+    context_chunks = int(cfgs_wm.get("context_chunks", 8))
+    goal_seconds = float(cfgs_hl.get("goal_seconds", 16.0))
+    chunk_seconds = frames_per_chunk / fps
+
+    plan_chunks = max(1, int(math.ceil(horizon_seconds / chunk_seconds)))
+    return HierarchyLayout(
+        frames_per_chunk=frames_per_chunk,
+        steps_per_chunk=tokens_per_chunk,
+        tubelet_size=tubelet,
+        context_chunks=context_chunks,
+        guidance_chunks=plan_chunks,
+        patches_per_chunk=(int(config["data"].get("crop_size", 256)) // int(config["encoder"].get("patch_size", 16))) ** 2,
+        goal_start_frame=context_chunks * frames_per_chunk + int(round(goal_seconds * fps)),
+        goal_position=context_chunks + (goal_seconds * fps) / frames_per_chunk,
+    )
+
+
+def build_hierarchical_geometry(
+    config: dict, hl_config: dict, horizon_seconds: float, use_goal: bool
+) -> RolloutGeometry:
+    """`build_geometry` for the hierarchical world model.
+
+    The rollout is the low-level model's: one step is one tubelet, and its window is the
+    clip it was trained on, so everything in the ordinary V-JEPA geometry carries over.
+    What it needs on top is history -- the high-level model conditions on
+    `context_chunks` chunks before the rollout even starts -- and, when the goal is
+    given, the chunk it sits in. Those are `lead_tokens` at the front and `extra_tokens`
+    at the back, and they are sized so the clip's first frame is exactly the first frame
+    of the high-level context. The clip prefix is then laid out precisely as in training,
+    which is what lets the planner be driven by the training code unchanged.
+    """
+    cfgs_data = config["data"]
+    cfgs_enc = config["encoder"]
+    cfgs_hl = config["high_level"]
+
+    fps = float(cfgs_data["fps"])
+    crop_size = int(cfgs_data.get("crop_size", 256))
+    patch_size = int(cfgs_enc.get("patch_size", 16))
+    tubelet_size = int(cfgs_enc.get("tubelet_size", 2))
+    if crop_size % patch_size != 0:
+        raise ValueError(f"crop_size ({crop_size}) is not a multiple of patch_size ({patch_size}).")
+
+    layout = hierarchy_layout(config, hl_config, horizon_seconds)
+    goal_seconds = float(cfgs_hl.get("goal_seconds", 16.0))
+    if use_goal and horizon_seconds > goal_seconds + 1e-6:
+        raise ValueError(
+            f"a {horizon_seconds:g}s rollout runs past a goal {goal_seconds:g}s away: the plan would "
+            "have to keep going after it had arrived, which the high-level model never saw in training. "
+            f"Use --horizon-seconds {goal_seconds:g} or less for the goal-conditioned variant."
+        )
+
+    # The low-level model's own trained clip, in its own tokens. Its length is set by
+    # the `guidance_chunks` the run was *trained* with -- one lead-in chunk plus those --
+    # not by how far the plan reaches here.
+    trained_chunks = int(cfgs_hl.get("guidance_chunks", 1)) + 1
+    window_tokens = trained_chunks * layout.steps_per_chunk
+    if window_tokens < 2:
+        raise ValueError("the low-level window holds too few temporal tokens to predict from")
+    step_seconds = tubelet_size / fps
+    num_steps = max(1, int(round(horizon_seconds / step_seconds)))
+
+    # T sits at the end of the high-level context, so the clip starts there.
+    lead_tokens = layout.context_chunks * layout.steps_per_chunk - window_tokens
+    if lead_tokens < 0:
+        raise ValueError(
+            f"the low-level window ({window_tokens} tokens) is longer than the high-level context "
+            f"({layout.context_chunks * layout.steps_per_chunk} tokens); there is no room for the plan"
+        )
+    # Ground truth already reaches `lead + num_steps + window_tokens` tokens; the goal
+    # chunk may sit beyond that.
+    base_frames = (lead_tokens + num_steps + window_tokens) * tubelet_size
+    goal_end = layout.goal_start_frame + layout.frames_per_chunk if use_goal else 0
+    extra_tokens = max(0, math.ceil((goal_end - base_frames) / tubelet_size))
+
+    grid = crop_size // patch_size
+    return RolloutGeometry(
+        fps=fps,
+        sampling_fps=fps,
+        tubelet_size=tubelet_size,
+        frames_per_token=tubelet_size,
+        frames_to_skip=1,
+        patch_size=patch_size,
+        crop_size=crop_size,
+        frames_per_clip=window_tokens * tubelet_size,
+        spatial_tokens=grid * grid,
+        window_tokens=window_tokens,
+        context_tokens=window_tokens - 1,
+        num_steps=num_steps,
+        is_causal=True,
+        uses_pretrained_backbone=False,
+        extra_tokens=extra_tokens,
+        lead_tokens=lead_tokens,
+    )
+
+
 def build_geometry_for(model_cfg: dict, config: dict, horizon_seconds: float) -> RolloutGeometry:
     kind = model_cfg.get("kind", "vjepa")
     if kind == "goal_world_model":
         return build_goal_world_model_geometry(
             config, horizon_seconds, model_cfg.get("goal_lead_seconds")
+        )
+    if kind == "hierarchical_world_model":
+        return build_hierarchical_geometry(
+            config,
+            load_config(config["high_level"]["config"]),
+            horizon_seconds,
+            bool(model_cfg.get("use_goal", False)),
         )
     if kind != "vjepa":
         raise ValueError(f"unknown model kind {kind!r}")
@@ -801,17 +994,120 @@ def prepare_goal_world_model(
     return bundled
 
 
-def goal_conditioning_label(model_cfg: dict) -> str:
-    if model_cfg.get("kind") != "goal_world_model":
+def prepare_hierarchical_world_model(
+    config: dict, checkpoint_path: str, device: str, use_goal: bool, horizon_seconds: float
+) -> ModelBundle:
+    """Rebuild the hierarchical world model: a frozen planner above, the trained
+    low-level predictor below.
+
+    The rollout driven here is the low-level model's, so the bundle looks like any other
+    V-JEPA one -- frozen causal encoder, causal predictor -- with a `planner` attached.
+    Both encoders are the same frozen module: nothing trains it, so its online and EMA
+    forms are the same weights.
+    """
+    cfgs_data = config["data"]
+    cfgs_enc = config["encoder"]
+    cfgs_model = config["model"]
+    cfgs_meta = config.get("meta", {})
+    cfgs_hl = config["high_level"]
+
+    hl_config = load_config(cfgs_hl["config"])
+    layout = hierarchy_layout(config, hl_config, horizon_seconds)
+
+    if not use_goal and float(hl_config["world_model"].get("goal_drop_prob", 0.0)) <= 0.0:
+        raise ValueError(
+            "the high-level model was trained with goal_drop_prob = 0, so its null goal was never "
+            "trained and it has never planned without one; planning unconditionally would measure an "
+            "untrained path. Retrain the high-level model with goal_drop_prob > 0."
+        )
+
+    high_level = load_goal_world_model(hl_config, cfgs_hl["checkpoint"], device)
+
+    encoder, predictor = init_low_level_model(
+        device=device,
+        encoder_checkpoint=cfgs_enc["checkpoint"],
+        encoder_checkpoint_key=cfgs_enc.get("checkpoint_key", "target_encoder"),
+        guidance_dim=high_level.embed_dim,
+        num_frames=(int(cfgs_hl.get("guidance_chunks", 1)) + 1) * layout.frames_per_chunk,
+        model_name=cfgs_enc.get("model_name", "vit_large"),
+        crop_size=int(cfgs_data.get("crop_size", 256)),
+        patch_size=int(cfgs_enc.get("patch_size", 16)),
+        tubelet_size=int(cfgs_enc.get("tubelet_size", 2)),
+        pred_depth=cfgs_model.get("pred_depth", 12),
+        pred_num_heads=cfgs_model.get("pred_num_heads", 12),
+        pred_embed_dim=cfgs_model.get("pred_embed_dim", 384),
+        num_mask_tokens=int(cfgs_model.get("num_mask_tokens", 4)),
+        guidance_step_ratio=layout.steps_per_chunk,
+        guidance_context_offset=layout.guidance_context_offset,
+        guidance_gate_init=cfgs_hl.get("gate_init", 0.0),
+        guidance_window=cfgs_hl.get("window", 1),
+        uniform_power=cfgs_enc.get("uniform_power", True),
+        use_sdpa=cfgs_meta.get("use_sdpa", False),
+        use_rope=cfgs_enc.get("use_rope", True),
+        use_silu=cfgs_enc.get("use_silu", False),
+        use_pred_silu=cfgs_model.get("use_pred_silu", False),
+        wide_silu=cfgs_enc.get("wide_silu", True),
+        use_activation_checkpointing=False,
+    )
+
+    checkpoint = robust_checkpoint_loader(checkpoint_path, map_location=torch.device("cpu"))
+    epoch = int(checkpoint.get("epoch", 0))
+    load_module_state_dict(
+        predictor, strip_ddp_prefix(checkpoint["predictor"]), "low-level predictor", epoch
+    )
+    del checkpoint
+
+    bundled = ModelBundle(
+        encoder=encoder,
+        predictor=predictor,
+        # Nothing trains the encoder, so its EMA target is the very same module.
+        target_encoder=encoder,
+        embed_dim=int(encoder.backbone.embed_dim),
+        epoch=epoch,
+        planner=HierarchicalPlanner(high_level=high_level, layout=layout, use_goal=use_goal),
+    )
+    for module in (bundled.encoder, bundled.predictor):
+        module.to(device)
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+    return bundled
+
+
+def model_goal_seconds(model_cfg: dict, config: dict) -> Optional[float]:
+    """How far ahead the goal this model is given sits, or None if it is given none.
+
+    That is the one thing that makes an entry privileged: a goal is a real chunk of
+    future video, so an entry that reads one cannot be compared like for like with one
+    that does not.
+    """
+    kind = model_cfg.get("kind", "vjepa")
+    if kind == "goal_world_model":
+        return model_cfg.get("goal_lead_seconds")
+    if kind == "hierarchical_world_model" and model_cfg.get("use_goal"):
+        return float(config["high_level"].get("goal_seconds", 16.0))
+    return None
+
+
+def goal_conditioning_label(model_cfg: dict, config: dict) -> str:
+    kind = model_cfg.get("kind", "vjepa")
+    if kind not in ("goal_world_model", "hierarchical_world_model"):
         return "n/a (model has no goal input)"
-    lead = model_cfg.get("goal_lead_seconds")
+    lead = model_goal_seconds(model_cfg, config)
     if lead is None:
         return "withheld (null goal)"
-    return f"supplied, held {lead:g}s ahead of the context (PRIVILEGED: reads past the frontier)"
+    where = "the context" if kind == "goal_world_model" else "the start of the rollout"
+    return f"supplied, {lead:g}s past {where} (PRIVILEGED: reads past the frontier)"
 
 
-def prepare_bundle(model_cfg: dict, config: dict, checkpoint_path: str, device: str) -> ModelBundle:
+def prepare_bundle(
+    model_cfg: dict, config: dict, checkpoint_path: str, device: str, horizon_seconds: float
+) -> ModelBundle:
     kind = model_cfg.get("kind", "vjepa")
+    if kind == "hierarchical_world_model":
+        return prepare_hierarchical_world_model(
+            config, checkpoint_path, device, bool(model_cfg.get("use_goal", False)), horizon_seconds
+        )
     if kind == "goal_world_model":
         return prepare_goal_world_model(
             config, checkpoint_path, device, model_cfg.get("goal_lead_seconds")
@@ -1146,7 +1442,7 @@ def encode_ground_truth(
     """
     normalized, means, sigmas = [], [], []
     for window in range(geom.num_steps + 1):
-        frames = temporal_slice(clip, window, geom.window_tokens, geom.tubelet_size)
+        frames = temporal_slice(clip, geom.lead_tokens + window, geom.window_tokens, geom.tubelet_size)
         with torch.autocast(**autocast_kwargs):
             tokens = bundle.target_encoder([frames])[0]
         tokens = tokens.float()[:, -geom.spatial_tokens :]
@@ -1176,7 +1472,7 @@ def encode_context(
     the returned tokens occupy window positions 0 .. n_ctx*S-1 - which is the
     positional frame the predictor's masks are expressed in.
     """
-    frames = temporal_slice(clip, first_token, geom.context_tokens, geom.tubelet_size)
+    frames = temporal_slice(clip, geom.lead_tokens + first_token, geom.context_tokens, geom.tubelet_size)
     with torch.autocast(**autocast_kwargs):
         return bundle.encoder([frames])[0]
 
@@ -1203,7 +1499,7 @@ def encode_goals(
     PRIVILEGED: these frames sit ahead of the rollout's frontier, so a model given them
     is seeing real future video that no other model in this report gets.
     """
-    start = schedule.first_frame
+    start = geom.lead_tokens * geom.tubelet_size + schedule.first_frame
     frames = clip[:, :, start : start + geom.num_steps * schedule.frames_per_chunk]
     with torch.autocast(**autocast_kwargs):
         tokens = bundle.target_encoder([frames])[0]
@@ -1234,6 +1530,8 @@ def predict_next_token(
     autocast_kwargs: dict,
     goal: Optional[torch.Tensor] = None,
     goal_pos: Optional[float] = None,
+    guidance: Optional[torch.Tensor] = None,
+    guidance_time_shift: int = 0,
 ) -> torch.Tensor:
     """One step of the world model: (B, n_ctx*S, D) context -> (B, S, D) next frame.
 
@@ -1254,10 +1552,13 @@ def predict_next_token(
     index of the dataset a clip came from, which is information a rollout over an
     arbitrary manifest does not have.
 
-    `goal` is only ever set for the goal-conditioned chunk model, and is forwarded only
-    when present - a V-JEPA predictor has no such argument.
+    `goal` is only ever set for the goal-conditioned chunk model, and `guidance` for the
+    hierarchical one; each is forwarded only when present, since a plain V-JEPA predictor
+    has neither argument.
     """
     goal_kwargs = {} if goal is None else {"goal": goal, "goal_pos": goal_pos}
+    if guidance is not None:
+        goal_kwargs = {"guidance": guidance, "guidance_time_shift": guidance_time_shift}
     with torch.autocast(**autocast_kwargs):
         if geom.is_causal:
             out = bundle.predictor.backbone(context, has_cls=False, **goal_kwargs)
@@ -1268,6 +1569,14 @@ def predict_next_token(
                 context, context_mask, predict_mask, mask_index=mask_token_index, has_cls=False
             )
     return out.float()
+
+
+def plan_kwargs(bundle: ModelBundle, plan: Optional[torch.Tensor], step: int) -> dict:
+    """The sub-goal arguments for one rollout step, or nothing for a model with no plan."""
+    if plan is None or bundle.planner is None:
+        return {}
+    guidance, shift = bundle.planner.sub_goal(plan, step)
+    return {"guidance": guidance, "guidance_time_shift": shift}
 
 
 def context_scale(context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1392,6 +1701,8 @@ def rollout_clips(
                 if bundle.goal_schedule is None
                 else encode_goals(bundle, geom, clip, bundle.goal_schedule, autocast_kwargs)
             )
+            # The plan is made once, at the instant the rollout starts, and then held.
+            plan = None if bundle.planner is None else bundle.planner.build(clip)
 
             # Observed context starts at temporal token 1: token 0 exists only so
             # the last observed frame has a full ground-truth window behind it.
@@ -1418,6 +1729,7 @@ def rollout_clips(
                     autocast_kwargs,
                     goal=None if goals is None else goals[:, step],
                     goal_pos=None if goals is None else bundle.goal_schedule.position,
+                    **plan_kwargs(bundle, plan, step),
                 )
                 target = ground_truth.normalized[:, step + 1]
 
@@ -1520,6 +1832,7 @@ def rollout_clips(
                     autocast_kwargs,
                     feedback_mode,
                     goals,
+                    plan,
                 )
 
             result.rows.extend(batch_rows)
@@ -1551,6 +1864,7 @@ def add_teacher_forced_metrics(
     autocast_kwargs: dict,
     feedback_mode: str,
     goals: Optional[torch.Tensor] = None,
+    plan: Optional[torch.Tensor] = None,
 ) -> None:
     """Attach the single-step (teacher-forced) distance for every step, in place.
 
@@ -1577,6 +1891,7 @@ def add_teacher_forced_metrics(
             autocast_kwargs,
             goal=None if goals is None else goals[:, step],
             goal_pos=None if goals is None else bundle.goal_schedule.position,
+            **plan_kwargs(bundle, plan, step),
         )
         target = ground_truth.normalized[:, step + 1]
         distances = frame_distances(prediction, target)
@@ -1866,7 +2181,7 @@ def goal_pairs(
         for withheld in usable:
             if (
                 not model_meta[withheld].get("privileged")
-                and model_meta[withheld].get("kind") == "goal_world_model"
+                and model_meta[withheld].get("kind") == model_meta[supplied].get("kind")
                 and model_meta[withheld]["checkpoint"] == model_meta[supplied]["checkpoint"]
             ):
                 pairs.append((withheld, supplied))
@@ -2197,7 +2512,10 @@ def generate_markdown_report(
             "comparison meaningless. What this measures is whether training *with* a goal produced a "
             "better world model - not whether a goal helps at inference, which this report does not ask."
         )
-    if any(meta.get("privileged") for meta in model_meta.values()):
+    if any(
+        meta.get("privileged") and meta.get("kind") == "goal_world_model"
+        for meta in model_meta.values()
+    ):
         lines.append(
             "2c. **A second, PRIVILEGED entry hands that goal back.** The `goal Ns ahead` variant is the "
             "same weights and the same clips, but at every step it is given the target-encoder latent of "
@@ -2208,6 +2526,32 @@ def generate_markdown_report(
             "its own goal-withheld twin: the gap between the two is what the goal is worth to this model, "
             "and it is the only pair in the report that differs by exactly one thing."
         )
+    hierarchical = {n: m for n, m in model_meta.items() if m.get("kind") == "hierarchical_world_model"}
+    if hierarchical:
+        geom = next(iter(hierarchical.values()))["geometry"]
+        chunk_s = geom.step_seconds * next(iter(hierarchical.values()))["steps_per_chunk"]
+        lines.append(
+            f"2d. **The hierarchical model rolls out its lower level, under a plan its upper level "
+            f"makes once.** Both levels start from the same instant T, the end of the rollout's "
+            f"context. There the frozen upper level -- which conditions on a longer history of its "
+            f"own, which is why these entries decode {geom.lead_tokens * geom.frames_per_token} frames "
+            f"of video *before* the rollout even begins -- predicts the chunk covering the next "
+            f"{chunk_s:.0f}s, feeds that back as though observed, predicts the one after, and so on "
+            f"until the plan spans the whole {geom.horizon_seconds:.0f}s horizon. Nothing after T "
+            "enters it. The lower level then steps at the ordinary V-JEPA rate, reading the chunk of "
+            f"the plan it is predicting into and switching to the next every "
+            f"{next(iter(hierarchical.values()))['steps_per_chunk']} steps. Because the window slides "
+            "one step at a time while the plan advances a chunk at a time, each step is told how far "
+            "into its chunk it has got, reproducing the alignment it was trained with."
+        )
+        if any(m.get("privileged") for m in hierarchical.values()):
+            lines.append(
+                "2e. **The goal-conditioned variant of it is PRIVILEGED.** It is the same weights and "
+                "the same clips, but the upper level plans toward the real latent of a chunk "
+                "`goal_seconds` past T. That chunk is future video, and at this horizon it is the very "
+                "interval the last steps are scored against, so the entry is a ceiling rather than a "
+                "measurement. Read it only against its goal-withheld twin."
+            )
     lines.append(
         "3. **Masks follow the model's own interface.** For a non-causal model the context mask covers "
         "every patch of every temporal token but the last and the prediction mask covers exactly the "
@@ -2288,6 +2632,8 @@ def generate_markdown_report(
         intra = f"{geom.intra_tubelet_seconds:.2f}" if geom.tubelet_size > 1 else "n/a (1 frame)"
         if meta.get("kind") == "goal_world_model":
             name = f"{name} \u2020"
+        if meta.get("kind") == "hierarchical_world_model":
+            name = f"{name} \u00a7"
         if meta.get("privileged"):
             name = f"{name} \u2021"
         lines.append(
@@ -2318,20 +2664,43 @@ def generate_markdown_report(
             "also marked \u2021 was given one."
         )
         lines.append("")
+    if hierarchical:
+        geom = next(iter(hierarchical.values()))["geometry"]
+        lines.append(
+            f"\u00a7 The hierarchical entries decode "
+            f"{geom.lead_tokens * geom.frames_per_token} frame(s) of history *before* the rollout "
+            "window, which the upper level conditions on. That is history, not future: it ends where "
+            "the rollout begins. It is included in the `Source frames` column, so their totals are "
+            "not comparable with the flat models' as a measure of rollout length."
+        )
+        lines.append("")
     privileged = [
         (name, meta) for name, meta in model_meta.items() if meta.get("privileged")
     ]
     if privileged:
         for name, meta in privileged:
             geom = meta["geometry"]
-            lines.append(
-                f"\u2021 **{name} is privileged and is not a like-for-like measurement.** Its goal is "
-                f"supplied at every step, held {meta['goal_lead_seconds']:g}s ahead of the context, which "
-                f"means {geom.extra_tokens * geom.frames_per_token} extra frame(s) of real video are read "
-                f"past the end of the rollout - {geom.total_frames} frames decoded in total against "
-                f"{geom.window_tokens + geom.num_steps} tokens' worth of rollout. Compare it with its "
-                "goal-withheld twin, not with the other models."
+            lead = meta["goal_lead_seconds"]
+            where = (
+                "ahead of the context, at every step"
+                if meta.get("kind") == "goal_world_model"
+                else "past the start of the rollout, once, before the first step"
             )
+            note = (
+                f"\u2021 **{name} is privileged and is not a like-for-like measurement.** It is given "
+                f"the real latent of the chunk {lead:g}s {where}, so "
+                f"{geom.extra_tokens * geom.frames_per_token} frame(s) of real video from beyond the "
+                f"rollout's frontier enter it - {geom.total_frames} frames decoded in all. Compare it "
+                "with its goal-withheld twin, not with the other models."
+            )
+            if lead is not None and lead <= geom.horizon_seconds + 1e-6:
+                note += (
+                    f" **Note the goal sits {lead:g}s ahead and the horizon is "
+                    f"{geom.horizon_seconds:.0f}s**: the goal is ground truth for the very interval the "
+                    "last steps are scored on, so the end of this curve is close to being handed the "
+                    "answer."
+                )
+            lines.append(note)
         lines.append("")
     lines.append(
         "> The step size fixes how many steps a fixed ~1-minute horizon takes, and it varies a lot "
@@ -2479,8 +2848,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--horizon-seconds",
         type=float,
-        default=60.0,
-        help="How far ahead to roll out, in seconds of video time.",
+        default=16.0,
+        help=(
+            "How far ahead to roll out, in seconds of video time. The default matches the "
+            "hierarchical model's goal distance: with a goal 16s away, a longer rollout would run "
+            "past it and ask the planner to keep going after it had arrived."
+        ),
     )
     parser.add_argument("--num-clips", type=int, default=16, help="Number of clips to roll out per model.")
     parser.add_argument(
@@ -2643,21 +3016,29 @@ def main() -> None:
         logger.info("%s", "=" * 80)
 
         try:
-            bundle = prepare_bundle(model_cfg, config, checkpoint_path, device)
+            bundle = prepare_bundle(model_cfg, config, checkpoint_path, device, args.horizon_seconds)
         except Exception as exc:
             logger.error("Failed to load %s: %s", model_name, exc)
             skipped_models.append((model_name, f"could not be loaded ({exc})"))
             continue
 
-        if model_cfg.get("goal_lead_seconds") is not None:
+        goal_seconds = model_goal_seconds(model_cfg, config)
+        if goal_seconds is not None:
             logger.warning(
-                "PRIVILEGED RUN: %s is rolled out with its goal supplied, held %.1fs ahead of the "
-                "context at every step. That reads real video %d frame(s) past the rollout's "
-                "frontier, which no other model here gets, so its numbers are a ceiling to compare "
-                "against the goal-withheld entry - not a like-for-like measurement.",
+                "PRIVILEGED RUN: %s is given the real latent of a chunk %.1fs ahead. That reads %d "
+                "frame(s) of real video from beyond the rollout's frontier, which no other model here "
+                "gets, so its numbers are a ceiling to compare against its goal-withheld twin - not a "
+                "like-for-like measurement.%s",
                 model_name,
-                float(model_cfg["goal_lead_seconds"]),
+                goal_seconds,
                 geom.extra_tokens * geom.frames_per_token,
+                (
+                    f" The goal is {goal_seconds:g}s ahead and the horizon is "
+                    f"{geom.horizon_seconds:.0f}s, so it is ground truth for the very interval the last "
+                    "steps are scored on."
+                    if goal_seconds <= geom.horizon_seconds + 1e-6
+                    else ""
+                ),
             )
         logger.info(
             "%s: %s, %.3f fps, tubelet %d, %d spatial tokens, %d context tokens (%.1fs), "
@@ -2682,8 +3063,11 @@ def main() -> None:
             "epoch": bundle.epoch,
             "geometry": geom,
             "kind": model_cfg.get("kind", "vjepa"),
-            "goal_lead_seconds": model_cfg.get("goal_lead_seconds"),
-            "privileged": model_cfg.get("goal_lead_seconds") is not None,
+            "goal_lead_seconds": model_goal_seconds(model_cfg, config),
+            "privileged": model_goal_seconds(model_cfg, config) is not None,
+            "steps_per_chunk": (
+                bundle.planner.steps_per_chunk if bundle.planner is not None else None
+            ),
         }
 
         try:
@@ -2756,10 +3140,11 @@ def main() -> None:
                     "horizon_seconds": geom.horizon_seconds,
                     "is_causal": geom.is_causal,
                     "kind": model_cfg.get("kind", "vjepa"),
-                    "goal_conditioning": goal_conditioning_label(model_cfg),
-                    "goal_lead_seconds": model_cfg.get("goal_lead_seconds"),
-                    "reads_future_beyond_rollout": model_cfg.get("goal_lead_seconds") is not None,
+                    "goal_conditioning": goal_conditioning_label(model_cfg, config),
+                    "goal_lead_seconds": model_goal_seconds(model_cfg, config),
+                    "reads_future_beyond_rollout": model_goal_seconds(model_cfg, config) is not None,
                     "extra_tokens": geom.extra_tokens,
+                    "lead_tokens": geom.lead_tokens,
                     "feedback": args.feedback,
                     "feedback_is_oracle": args.feedback in ORACLE_FEEDBACK_MODES,
                     "checkpoint": checkpoint_path,

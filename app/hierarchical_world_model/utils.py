@@ -265,7 +265,7 @@ class HierarchyLayout:
 
 
 @torch.no_grad()
-def plan_sub_goals(high_level, clip, layout):
+def plan_sub_goals(high_level, clip, layout, use_goal=True):
     """Roll the frozen high-level model forward from T, and return its plan.
 
     At T the model has observed `context_chunks` chunks and is given the latent of the
@@ -285,15 +285,26 @@ def plan_sub_goals(high_level, clip, layout):
     chunk-encoder ones, so a prediction fed back has its per-token scale restored from
     the real context first -- the `rescale` bridge of evals/generate_world_model_report.py.
 
+    With `use_goal=False` the rollout runs on the high-level model's learned null goal
+    instead -- the unconditional path its `goal_drop_prob` trains. The plan is then made
+    with no intention supplied, and the goal chunk is not read at all.
+
     :return: [B, guidance_chunks * P, high-level embed dim]
     """
     fpc, patches = layout.frames_per_chunk, layout.patches_per_chunk
     context = clip[:, :, : layout.split_frame]
-    goal_clip = clip[:, :, layout.goal_start_frame : layout.goal_start_frame + fpc]
-
     z = high_level.encoder(context)
-    goal = high_level.target_encoder(goal_clip)
-    goal = F.layer_norm(goal, (goal.size(-1),))
+
+    if use_goal:
+        goal_clip = clip[:, :, layout.goal_start_frame : layout.goal_start_frame + fpc]
+        goal = high_level.target_encoder(goal_clip)
+        goal = F.layer_norm(goal, (goal.size(-1),))
+        keep_goal = None  # keep every goal
+    else:
+        # Inert placeholders: with `keep_goal` all False the predictor substitutes its
+        # learned null goal and null horizon, and neither of these is read.
+        goal = z.new_zeros(z.size(0), patches, z.size(-1))
+        keep_goal = torch.zeros(z.size(0), dtype=torch.bool, device=z.device)
 
     # Scale of the real chunk latents, frozen at the only window that is entirely real.
     real = z.float()
@@ -303,7 +314,9 @@ def plan_sub_goals(high_level, clip, layout):
     sub_goals = []
     for step in range(layout.guidance_chunks):
         goal_pos = torch.full((clip.size(0),), layout.goal_position - step, device=clip.device)
-        prediction = high_level.predictor(z, goal=goal, goal_pos=goal_pos)[:, -patches:]
+        prediction = high_level.predictor(
+            z, goal=goal, goal_pos=goal_pos, keep_goal=keep_goal
+        )[:, -patches:]
         prediction = F.layer_norm(prediction, (prediction.size(-1),))
         sub_goals.append(prediction)
         if step + 1 < layout.guidance_chunks:
