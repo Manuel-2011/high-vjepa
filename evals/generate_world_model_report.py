@@ -698,6 +698,21 @@ def hierarchy_layout(config: dict, hl_config: dict, horizon_seconds: float) -> H
     )
 
 
+def plan_lead_schedule(config: dict, hl_config: dict, horizon_seconds: float) -> List[float]:
+    """How far ahead the goal sits at each step of the plan, in seconds.
+
+    The goal is *fixed*: one chunk of video at one instant, encoded once. What changes is
+    the plan's own position -- each step rolls the high-level context forward by a chunk,
+    so the goal is a chunk nearer than it was. That is the point of a goal image, but it
+    means a long plan eventually stands closer to the goal than any goal the high-level
+    model was trained to see, and its tail is then extrapolating.
+    """
+    layout = hierarchy_layout(config, hl_config, horizon_seconds)
+    goal_seconds = float(config["high_level"].get("goal_seconds", 16.0))
+    chunk_seconds = layout.frames_per_chunk / float(config["data"]["fps"])
+    return [goal_seconds - k * chunk_seconds for k in range(layout.guidance_chunks)]
+
+
 def build_hierarchical_geometry(
     config: dict, hl_config: dict, horizon_seconds: float, use_goal: bool
 ) -> RolloutGeometry:
@@ -731,6 +746,21 @@ def build_hierarchical_geometry(
             "have to keep going after it had arrived, which the high-level model never saw in training. "
             f"Use --horizon-seconds {goal_seconds:g} or less for the goal-conditioned variant."
         )
+    if use_goal:
+        goal_min = float(hl_config["world_model"].get("goal_min_seconds", 4.0))
+        leads = plan_lead_schedule(config, hl_config, horizon_seconds)
+        short = [lead for lead in leads if lead < goal_min - 1e-6]
+        if short:
+            logger.warning(
+                "The goal is fixed, so the plan closes on it: its lead runs %.0fs -> %.0fs over %d "
+                "step(s). The last %d of those stand closer than the %.0fs minimum the high-level "
+                "model was trained with, so the tail of the plan (video from %.0fs after the rollout "
+                "starts) is extrapolating. Shorten --horizon-seconds to %.0f to keep every step in "
+                "range, or retrain the high-level model with a smaller goal_min_seconds.",
+                leads[0], leads[-1], len(leads), len(short), goal_min,
+                (len(leads) - len(short)) * layout.frames_per_chunk / float(config["data"]["fps"]),
+                (goal_seconds - goal_min + layout.frames_per_chunk / float(config["data"]["fps"])),
+            )
 
     # The low-level model's own trained clip, in its own tokens. Its length is set by
     # the `guidance_chunks` the run was *trained* with -- one lead-in chunk plus those --
@@ -2545,6 +2575,8 @@ def generate_markdown_report(
             "into its chunk it has got, reproducing the alignment it was trained with."
         )
         if any(m.get("privileged") for m in hierarchical.values()):
+            meta = next(m for m in hierarchical.values() if m.get("privileged"))
+            leads = meta.get("plan_leads") or []
             lines.append(
                 "2e. **The goal-conditioned variant of it is PRIVILEGED.** It is the same weights and "
                 "the same clips, but the upper level plans toward the real latent of a chunk "
@@ -2552,6 +2584,22 @@ def generate_markdown_report(
                 "interval the last steps are scored against, so the entry is a ceiling rather than a "
                 "measurement. Read it only against its goal-withheld twin."
             )
+            if leads:
+                in_range = meta.get("plan_leads_in_range")
+                lines.append(
+                    "    The goal is **fixed**, one chunk of video at one instant, encoded once. The "
+                    "plan does not carry it along: each step rolls the context forward, so the goal "
+                    f"stands a chunk nearer than before -- its lead runs {leads[0]:.0f}s -> "
+                    f"{leads[-1]:.0f}s across the {len(leads)} steps of the plan. That is what a goal "
+                    "image is for, but it does mean the later steps see the goal closer than the "
+                    "high-level model was trained to."
+                    + (
+                        ""
+                        if in_range is None or in_range >= len(leads)
+                        else f" **{len(leads) - in_range} of {len(leads)} plan step(s) fall outside "
+                        f"its trained goal range**, so the tail of the plan is extrapolating."
+                    )
+                )
     lines.append(
         "3. **Masks follow the model's own interface.** For a non-causal model the context mask covers "
         "every patch of every temporal token but the last and the prediction mask covers exactly the "
@@ -3069,6 +3117,14 @@ def main() -> None:
                 bundle.planner.steps_per_chunk if bundle.planner is not None else None
             ),
         }
+        if model_cfg.get("kind") == "hierarchical_world_model" and model_cfg.get("use_goal"):
+            hl_config = load_config(config["high_level"]["config"])
+            leads = plan_lead_schedule(config, hl_config, args.horizon_seconds)
+            goal_min = float(hl_config["world_model"].get("goal_min_seconds", 4.0))
+            model_meta[model_name]["plan_leads"] = leads
+            model_meta[model_name]["plan_leads_in_range"] = sum(
+                1 for lead in leads if lead >= goal_min - 1e-6
+            )
 
         try:
             transform = make_transforms(
